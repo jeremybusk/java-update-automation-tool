@@ -1,259 +1,163 @@
-# Java OpenRewrite migration engine
+# Java repository update portfolio
 
-A batch migration CLI for cloning public or private Git repositories and moving
-Maven and Gradle applications to Java 11, 17, 21, or 25. Java 21 is the default.
-It runs in a Microsoft dev container, uses a repository's build wrapper when
-available, isolates failures, verifies migrated builds, and emits JSON and
-Markdown reports.
+This repository investigates and updates related Maven and Gradle Git repositories as a four-stage, rerunnable workflow. Define repositories once in YAML, select one repository, an application, or an application group, and retain every machine-readable artifact needed by the next stage.
 
-The tool never modifies a local input directory. It copies local inputs or clones
-remote inputs to `artifacts/<name>` and migrates that copy. If the destination
-already exists it is reported as `skipped`; pass `--force` to replace that one
-destination. `artifacts/` and `.migration-work/` are gitignored.
+YAML configuration and generated JSON are the source of truth. Markdown reports are generated views with review checklists.
 
-## Default migration policy
+## Quick start
 
-Recipe artifacts resolve from Maven Central by default, with no Code Genome
-account or credentials required. The default versions are pinned to the newest
-releases verified in Maven Central so a later Code Genome-only release cannot
-silently break a run.
-
-- Analyze each build before rewriting. The report records direct dependencies,
-  detected frameworks/languages, removed JDK APIs, internal JDK usage, generated
-  paths, and external CI/toolchain files.
-- Run separate Java, compatibility, test migration, test cleanup, dependency,
-  source cleanup, and custom-recipe phases. Every phase and its recipes are
-  recorded independently, so a failure has a useful boundary.
-- Run `UpgradeToJava<target>` to update sources, build settings, plugins, CI, and
-  known incompatible APIs. Java EE/Jakarta changes remain explicit because a
-  namespace change often crosses application-server and contract boundaries.
-- Migrate JUnit 4 to JUnit 5 when JUnit is detected. The standard pack also
-  migrates Mockito 4 to 5 and applies JUnit 5 best practices; Gradle projects get
-  an explicit JUnit Platform launcher to keep engine and launcher versions
-  aligned.
-- Upgrade only direct, literal-version dependencies. Coordinated ecosystems such
-  as Spring, Hibernate, Jackson, JUnit, and Mockito are skipped unless pinned;
-  deny rules and organization-approved pins can further constrain updates.
-- Apply common static-analysis cleanup after compatibility work.
-- Discover independent Maven and Gradle build roots in monorepos without running
-  ordinary nested modules twice.
-- Clone submodules by default, support Git LFS, and use the container Gradle when
-  an old wrapper cannot start on the modern migration JVM.
-- Run tests after rewriting, then run `jdeps --jdk-internals` and
-  `jdeprscan --for-removal`; retain detailed diagnostics in JSON and summarize
-  them in Markdown.
-- List likely stale Java 8 runbooks/configuration in each project's
-  `manual_review` report field instead of deleting organization-specific files.
-
-`--build-best-practices` is opt-in because the current Gradle composite can make
-a Gradle major-version upgrade. Framework migrations such as Spring Boot and
-Quarkus should be added deliberately with `--recipe` and a matching `--artifact`;
-there is no universally safe framework target.
-
-## Profiles and policy as code
-
-Profiles set risk-appropriate defaults; any individual option can override them.
-
-| Profile | Cleanup | Tests | Dependencies | Post-checks |
-| --- | --- | --- | --- | --- |
-| `conservative` | off | JUnit migration | none | JDK diagnostics |
-| `standard` (default) | common cleanup | JUnit + Mockito | patch | JDK diagnostics |
-| `aggressive` | cleanup + build best practices | deeper Mockito cleanup | latest | JDK + dependency report |
-| `report-only` | no rewrite | no rewrite | no rewrite | analysis only |
-
-Start by inventorying a portfolio without downloading recipe artifacts:
+The checked-in [`repositories.yml`](repositories.yml) points at the two local example projects.
 
 ```bash
-python3 migrate.py --manifest repositories.txt --profile report-only --jobs 4
+python3 -m pip install -r requirements.txt
+python3 portfolio.py validate
+python3 portfolio.py run --application legacy-catalog
 ```
 
-For repeatable fleet migrations, copy
-[`migration-policy.example.yml`](migration-policy.example.yml), review its deny
-rules and pins, then run:
+The default run safely stops after planning. Its output is under `.java-update/`:
 
-```bash
-python3 migrate.py --manifest repositories.txt \
-  --policy migration-policy.yml --jobs 4
+```text
+.java-update/
+├── 01-discovery/
+│   ├── repositories/<repo>/result.json
+│   ├── applications/<application>/result.json
+│   └── application-groups/<group>/result.json
+├── 02-assessment/
+│   ├── repositories/<repo>/result.json
+│   ├── applications/<application>/result.json
+│   └── application-groups/<group>/result.json
+├── 03-planning/
+│   ├── repositories/<repo>/plan.json
+│   ├── applications/<application>/plan.json
+│   └── application-groups/<group>/plan.json
+├── 04-migration/
+│   ├── repositories/<repo>/
+│       ├── migration-policy.json
+│       └── result.json
+│   ├── applications/<application>/result.json
+│   └── application-groups/<group>/result.json
+├── reports/                 # disposable Markdown views
+├── repositories/            # managed remote discovery checkouts
+└── runs/                     # invocation receipts
 ```
 
-The policy supports `targetJava`, `buildTool`, profiles, test/Jakarta/Lombok
-packs, dependency strategy/deny/pin rules, exclusion globs, extra recipes and
-artifacts, build verification, JDK/dependency diagnostics, strict diagnostics,
-custom verification commands, and report format. CLI options take precedence.
-YAML support is included in the devcontainer; a JSON policy works with a stock
-Python install.
+## Portfolio YAML
 
-Useful targeted packs and safety controls:
+Each repository needs only a name, source, application association, and application-group association. `repo_id` is optional and becomes the stable key when present. `depends_on` controls migration wave ordering.
 
-```bash
-# Explicit Java EE namespace/application-server target.
-python3 migrate.py ./legacy-ee --jakarta 10
+```yaml
+schema_version: 1
+repositories:
+  - repo_name: orders-api
+    repo_id: orders-api-prod
+    source: git@github.com:acme/orders-api.git
+    ref: main
+    application_id: orders
+    application_group_id: commerce
+    role: api
 
-# Lombok cleanup is opt-in; Lombok + MapStruct binding is detected automatically.
-python3 migrate.py ./service --lombok-best-practices
-
-# Protect or approve individual dependency families.
-python3 migrate.py ./service \
-  --dependency-deny 'com.mycompany:*' \
-  --dependency-pin 'org.apache.commons:commons-lang3=3.17.0'
-
-# Treat jdeps/jdeprscan/custom check failures as migration failures.
-python3 migrate.py ./service --post-checks all --strict-post-checks \
-  --verify-command './scripts/integration-test.sh'
+  - repo_name: orders-worker
+    source: git@github.com:acme/orders-worker.git
+    application_id: orders
+    application_group_id: commerce
+    role: worker
+    depends_on: [orders-api-prod]
 ```
 
-Generated and vendored trees are excluded by default. Repeat `--exclude` for
-project-specific globs or use `--no-default-exclusions` when generated sources
-are intentionally migration input.
+Local sources are resolved relative to the portfolio file. HTTPS, SSH, and Git URLs are supported. Git credentials follow the normal Git credential/SSH configuration used by the existing migration engine.
 
-## Credentials
+The format is documented by [`schemas/repositories.schema.json`](schemas/repositories.schema.json).
 
-Git credentials and recipe-repository credentials are independent:
+## Root update policy
 
-1. `GIT_TOKEN` is a GitHub/GitLab/Bitbucket PAT used only by a temporary
-   `GIT_ASKPASS` helper. It is never put in clone URLs or command logs. Public
-   HTTPS repositories need no PAT. Override the username with `--git-username`
-   (GitHub defaults to `x-access-token`; GitLab commonly uses `oauth2`). SSH URLs
-   use your normal SSH configuration instead.
-2. No recipe-repository credentials are needed for the default Maven Central
-   mode. `CODE_GENOME_USERNAME` and `CODE_GENOME_TOKEN` are read only when
-   `--recipe-repository codegenome` is selected. They are artifact credentials,
-   not Git credentials.
+[`java-update.yml`](java-update.yml) owns desired and acceptable Java/Spring Boot versions, dependency families that must remain aligned, optional exact dependency pins, discovery behavior, migration verification, and OpenRewrite recipes.
+
+The checked-in defaults target Java 25 and the Spring Boot 4.0.x line. Java 21/25 and Spring Boot 3.5.x/4.0.x are accepted during staged rollout. These are policy choices, not constants in the Python code—review them for your runtime, vendor support, and platform BOMs.
+
+For alignment, a dependency is compared only when it occurs in two or more selected related repositories. Put exact organization decisions under `alignment.dependencies.pins`; when mismatched libraries lack a pin, the generated plan deliberately records `decision-required` instead of guessing a version.
+
+The policy format is documented by [`schemas/java-update.schema.json`](schemas/java-update.schema.json).
+
+## Four stages
+
+1. `01-discovery` inspects Git state, Maven/Gradle roots, Java versions, Spring Boot versions, direct dependencies, features, and external build configuration.
+2. `02-assessment` evaluates desired/acceptable targets and compares versions across complete application and application-group cohorts.
+3. `03-planning` produces repository and cohort migration plans, explicit pending tasks, completion rules, and dependency-ordered waves.
+4. `04-migration` materializes the exact migration policy and command. It executes only when `--execute` is supplied, then retains the existing OpenRewrite engine's worktree, logs, and reports.
+
+Every stage can be rerun from its upstream JSON:
 
 ```bash
-export GIT_TOKEN='your-source-control-pat'
-# Only for --recipe-repository codegenome:
+# Refresh source and recreate discovery through planning.
+python3 portfolio.py run --application orders
+
+# Reassess and replan without touching source checkouts.
+python3 portfolio.py run --application orders \
+  --from 02-assessment --through 03-planning
+
+# Prepare stage 04 without executing OpenRewrite.
+python3 portfolio.py run --repo orders-api-prod \
+  --from 04-migration --through 04-migration
+
+# Execute after reviewing the plan and generated policy.
+python3 portfolio.py run --application orders \
+  --from 04-migration --through 04-migration --execute
+```
+
+Running a single repository is intentionally valid, but its application/group assessment is marked `incomplete-cohort`. Use application or group scope for a final alignment decision.
+
+## Selectors
+
+Use one selector kind per run; each option is repeatable.
+
+```bash
+python3 portfolio.py run --repo orders-api-prod
+python3 portfolio.py run --application orders
+python3 portfolio.py run --application-group commerce
+python3 portfolio.py run --all
+```
+
+With no selector, `--all` is implied.
+
+## Reports and checklists
+
+Runs automatically regenerate Markdown. You can regenerate it at any time without cloning repositories or changing JSON:
+
+```bash
+python3 portfolio.py report --application-group commerce
+python3 scripts/render_reports.py --state .java-update
+```
+
+The reusable [`java-update-reports` skill](skills/java-update-reports/SKILL.md) tells an agent how to regenerate and interpret reports without treating Markdown as state.
+
+## Migration credentials and recipes
+
+The default Spring Boot 4.0 recipe is distributed through Code Genome and requires:
+
+```bash
 export CODE_GENOME_USERNAME='you@example.com'
-export CODE_GENOME_TOKEN='your-code-genome-download-token'
+export CODE_GENOME_TOKEN='your-download-token'
 ```
 
-Public source does not necessarily mean Apache-licensed open source. OpenRewrite
-core and many building-block recipes are Apache 2.0, while the comprehensive
-Java migration, static-analysis, and testing recipe modules used by the default
-policy are Moderne Source Available License software. Maven Central mode is
-account-free, but it does not change those artifact licenses. Review the license
-before offering migrations as a product or service.
+It is configured in `java-update.yml` alongside the full recipe artifact set because the legacy migration engine treats a non-empty artifact list as an override. For Java-only, account-free migrations, clear `migration.openrewrite.recipes` and `artifacts`, then set `recipe_repository: maven-central`.
 
-## Recipe repositories
+Stage 04 delegates repository transformation to the existing [`migrate.py`](migrate.py) engine. That engine works on a copied/cloned worktree, runs OpenRewrite phases, verifies builds, and retains detailed JSON diagnostics. It does not edit local source inputs.
 
-Three explicit modes are supported:
+## Validation and tests
 
 ```bash
-# Default: account-free releases pinned from Maven Central.
-python3 migrate.py ./my-app --recipe-repository maven-central
-
-# Prefer recipes built and installed in ~/.m2/repository, then use Central for
-# their transitive dependencies and the OpenRewrite build plugin.
-python3 migrate.py ./my-app --recipe-repository maven-local \
-  --migrate-java-version YOUR_LOCAL_VERSION
-
-# Opt in to current Code Genome releases.
-python3 migrate.py ./my-app --recipe-repository codegenome
-```
-
-`maven-local` adds `mavenLocal()` for Gradle; Maven already checks its local
-repository first. Use the version flags or repeat `--artifact GROUP:NAME:VERSION`
-when locally built coordinates differ from the pinned defaults. To use an
-organization repository proxy in Central or Code Genome mode, pass
-`--artifact-repository https://repository.example/repository/maven-public`.
-
-## Dev container and Docker
-
-In VS Code, choose **Dev Containers: Reopen in Container**. The image is based on
-Microsoft's Java 21 Debian Trixie devcontainer and includes Python, Maven, and
-Gradle. Trixie is used instead of Ubuntu to stay on Microsoft's current default
-Java devcontainer line with fewer distribution-specific variables.
-
-The same image works directly with Docker:
-
-```bash
-docker build -t java-migrator -f .devcontainer/Dockerfile .
-
-docker run --rm \
-  -e GIT_TOKEN \
-  -v "$PWD:/workspace" -w /workspace \
-  java-migrator \
-  python3 migrate.py examples --target-java 21 --force
-```
-
-Add `-e CODE_GENOME_USERNAME -e CODE_GENOME_TOKEN` and
-`--recipe-repository codegenome` only for a Code Genome run.
-
-That migrates both included Java 8 fixtures and writes updated copies beneath
-`artifacts/examples`. Add `--dry-run --verify none` to test copying, discovery,
-recipe generation, and reporting without downloading artifacts.
-
-For Java 25 build verification, use a Java 25 image:
-
-```bash
-docker build --build-arg JAVA_VARIANT=25-trixie --build-arg GRADLE_VERSION=9.1.0 \
-  -t java-migrator:jdk25 -f .devcontainer/Dockerfile .
-```
-
-Gradle 9.1 is the minimum release that can itself run on Java 25; the default
-Gradle 8.14 line is retained for better compatibility while bootstrapping older
-projects on the default Java 21 image. For especially old Gradle/Android/Kotlin
-builds, migrate and validate Java 21 first, then use that output as the input to
-a separate Java 25 run.
-
-## Local and remote repositories
-
-```bash
-# The source is untouched; the result is artifacts/java8-maven.
-python3 migrate.py ./examples/java8-maven --target-java 21 --force
-
-# Clone and migrate a public or private repository.
-python3 migrate.py https://github.com/acme/service.git --target-java 21
-
-# Commit and push the result on automation/java-21.
-python3 migrate.py https://github.com/acme/service.git \
-  --target-java 21 --commit --push --force
-```
-
-Without `--commit`, changes remain uncommitted for review. `--push` requires a
-commit and a branch. Logs and reports live in `.migration-work/`. JSON retains
-complete machine-readable diagnostics while Markdown provides concise review
-pages. Both are generated by default; choose only one with
-`--report-format json` or `--report-format markdown`.
-
-## Batch migration
-
-TXT manifests accept `URL` or `URL REF`; CSV accepts `url,ref`; JSON accepts URL
-strings or objects like `{"url": "...", "ref": "main"}`.
-
-```bash
-python3 migrate.py --manifest repositories.txt \
-  --target-java 21 --jobs 4 --continue-projects
-```
-
-Keep concurrency conservative: each OpenRewrite JVM can consume substantial CPU
-and memory. The command returns nonzero if any repository fails. Re-running skips
-destinations already present; `--force` discards and recreates only the matching
-output destination.
-
-Git submodules are cloned by default; opt out with `--no-submodules`. Private
-dependency repositories continue to use your Maven settings and environment, so
-mount `~/.m2`/`~/.gradle` when a Docker run needs organization-specific config.
-
-Useful controls:
-
-```bash
-python3 migrate.py ./my-app --verify compile --dependency-strategy none
-python3 migrate.py ./my-app --no-cleanup --no-junit5
-python3 migrate.py ./mixed-repo --build-tool maven --max-depth 6
-```
-
-## Java 8 fixtures
-
-[`examples/`](examples/) contains independent Maven and Gradle apps with Java 8
-compiler settings, JUnit 4, stale dependencies/plugins, deprecated APIs,
-redundant source patterns, an old Java container, and obsolete runbooks. Prose
-and intentionally dead files demonstrate a boundary: a safe general-purpose
-tool should report them for human review rather than guess that they can be
-deleted.
-
-Run the unit tests with:
-
-```bash
+python3 portfolio.py validate
 python3 -m unittest discover -s tests -v
 ```
+
+JSON schemas help editors and CI validate structure. Runtime validation additionally enforces unique repository keys/names, valid dependency references, and one application group per application.
+
+## Legacy low-level CLI
+
+Use `migrate.py` directly when you already know the exact repository and migration policy and do not need portfolio association, consistency assessment, or staged plans:
+
+```bash
+python3 migrate.py ./service --target-java 25 --profile standard --force
+```
+
+See [`migration-policy.example.yml`](migration-policy.example.yml) for its detailed OpenRewrite policy fields.

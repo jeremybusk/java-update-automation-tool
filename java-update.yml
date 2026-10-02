@@ -1,0 +1,52 @@
+# Organization policy for investigation, alignment, and migration.
+# YAML is an input source of truth; generated stage artifacts are JSON.
+schema_version: 1
+
+targets:
+  java:
+    desired: 25
+    acceptable: [21, 25]
+  spring_boot:
+    # Spring Boot 4.0 has a complete OpenRewrite migration recipe. Change this
+    # after validating newer lines against your build plugins and platform BOMs.
+    desired: "4.0.x"
+    acceptable: ["3.5.x", "4.0.x"]
+
+discovery:
+  build_tool: auto
+  max_depth: 5
+
+alignment:
+  dependencies:
+    # Only dependencies present in two or more related repos are compared.
+    include:
+      - "org.springframework*:*"
+      - "com.fasterxml.jackson*:*"
+      - "org.junit*:*"
+      - "org.mockito:*"
+      - "org.apache.logging.log4j:*"
+    exclude:
+      - "org.springframework.boot:*" # governed by the Spring Boot target/BOM
+    # Explicit pins remove ambiguity from generated plans. Add organization BOM
+    # or contract-library coordinates here.
+    pins: {}
+
+migration:
+  profile: standard
+  verification:
+    build: test
+    postChecks: jdk
+    strict: false
+    commands: []
+  openrewrite:
+    # This recipe repository needs CODE_GENOME_USERNAME/CODE_GENOME_TOKEN.
+    # Clear recipes/artifacts and use maven-central for Java-only migrations.
+    recipe_repository: codegenome
+    recipes:
+      - org.openrewrite.java.spring.boot4.UpgradeSpringBoot_4_0
+    artifacts:
+      - org.openrewrite.recipe:rewrite-migrate-java:3.45.0
+      - org.openrewrite.recipe:rewrite-static-analysis:2.44.0
+      - org.openrewrite.recipe:rewrite-java-dependencies:1.63.0
+      - org.openrewrite.recipe:rewrite-testing-frameworks:3.47.0
+      - org.openrewrite.recipe:rewrite-spring:6.40.0

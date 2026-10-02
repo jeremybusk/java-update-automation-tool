@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/schemas/java-update.schema.json",
+  "title": "Java update policy",
+  "type": "object",
+  "required": ["schema_version", "targets"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "targets": {
+      "type": "object",
+      "required": ["java", "spring_boot"],
+      "properties": {
+        "java": {"$ref": "#/$defs/target"},
+        "spring_boot": {"$ref": "#/$defs/target"}
+      },
+      "additionalProperties": true
+    },
+    "discovery": {"type": "object"},
+    "alignment": {"type": "object"},
+    "migration": {"type": "object"}
+  },
+  "$defs": {
+    "target": {
+      "type": "object",
+      "required": ["desired", "acceptable"],
+      "properties": {
+        "desired": {"type": ["string", "integer"]},
+        "acceptable": {"type": "array", "minItems": 1, "items": {"type": ["string", "integer"]}}
+      }
+    }
+  }
+}

@@ -1,4 +1,5 @@
 .migration-work/
+.java-update/
 artifacts/
 __pycache__/
 *.py[cod]

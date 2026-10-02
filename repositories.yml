@@ -1,0 +1,18 @@
+# Minimal portfolio example. repo_id is optional; repo_name becomes the stable
+# key when repo_id is omitted. Paths are relative to this file.
+schema_version: 1
+repositories:
+  - repo_name: legacy-catalog-maven
+    repo_id: catalog-api
+    source: examples/java8-maven
+    application_id: legacy-catalog
+    application_group_id: commerce
+    role: api
+
+  - repo_name: legacy-catalog-gradle
+    repo_id: catalog-worker
+    source: examples/java8-gradle
+    application_id: legacy-catalog
+    application_group_id: commerce
+    role: worker
+    depends_on: [catalog-api]
