@@ -3,29 +3,315 @@
   "$id": "https://example.invalid/schemas/java-update.schema.json",
   "title": "Java update policy",
   "type": "object",
-  "required": ["schema_version", "targets"],
+  "required": [
+    "schema_version",
+    "targets"
+  ],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {
+      "const": 1
+    },
     "targets": {
       "type": "object",
-      "required": ["java", "spring_boot"],
+      "required": [
+        "java",
+        "spring_boot"
+      ],
       "properties": {
-        "java": {"$ref": "#/$defs/target"},
-        "spring_boot": {"$ref": "#/$defs/target"}
+        "java": {
+          "$ref": "#/$defs/target"
+        },
+        "spring_boot": {
+          "$ref": "#/$defs/target"
+        }
       },
       "additionalProperties": true
     },
-    "discovery": {"type": "object"},
-    "alignment": {"type": "object"},
-    "migration": {"type": "object"}
+    "discovery": {
+      "type": "object"
+    },
+    "alignment": {
+      "type": "object"
+    },
+    "migration": {
+      "type": "object"
+    },
+    "workflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": [
+            "manual",
+            "unattended"
+          ]
+        },
+        "checkpoints": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "01-discovery",
+              "02-assessment",
+              "03-planning",
+              "04-migration",
+              "05-validation",
+              "06-publishing"
+            ]
+          }
+        },
+        "show_diffs": {
+          "type": "boolean"
+        },
+        "include_dependencies": {
+          "type": "boolean"
+        },
+        "allow_dependency_override": {
+          "type": "boolean"
+        },
+        "allow_downgrades": {
+          "type": "boolean"
+        },
+        "dependency_evidence": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "validation": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "build": {
+              "enum": [
+                "test",
+                "compile"
+              ]
+            },
+            "commands": {
+              "$ref": "#/$defs/commands"
+            },
+            "timeout": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "repositories": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "object",
+                "required": [
+                  "commands"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "commands": {
+                    "$ref": "#/$defs/commands"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "publishing": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "targets": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "enum": [
+                  "local_repo",
+                  "src_repo",
+                  "dst_repo"
+                ]
+              }
+            },
+            "history": {
+              "enum": [
+                "default",
+                "all"
+              ]
+            },
+            "independent_applications": {
+              "type": "boolean"
+            },
+            "provider": {
+              "enum": [
+                "github",
+                "gitlab"
+              ]
+            },
+            "mode": {
+              "enum": [
+                "autocreate",
+                "precreated"
+              ]
+            },
+            "private": {
+              "type": "boolean"
+            },
+            "namespace_id": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1
+            },
+            "owner": {
+              "type": "string"
+            },
+            "prefix": {
+              "type": "string"
+            },
+            "default_branch": {
+              "type": "string",
+              "minLength": 1
+            },
+            "source_branch": {
+              "type": "string",
+              "minLength": 1
+            },
+            "source_default_branch": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "minLength": 1
+            },
+            "api_url": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "minLength": 1
+            },
+            "token_env": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "minLength": 1
+            },
+            "repositories": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "provider": {
+                    "enum": [
+                      "github",
+                      "gitlab"
+                    ]
+                  },
+                  "mode": {
+                    "enum": [
+                      "autocreate",
+                      "precreated"
+                    ]
+                  },
+                  "private": {
+                    "type": "boolean"
+                  },
+                  "namespace_id": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "minimum": 1
+                  },
+                  "owner": {
+                    "type": "string"
+                  },
+                  "prefix": {
+                    "type": "string"
+                  },
+                  "default_branch": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "source_branch": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "source_default_branch": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "minLength": 1
+                  },
+                  "api_url": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "minLength": 1
+                  },
+                  "token_env": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "minLength": 1
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "url": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
   },
   "$defs": {
     "target": {
       "type": "object",
-      "required": ["desired", "acceptable"],
+      "required": [
+        "desired",
+        "acceptable"
+      ],
       "properties": {
-        "desired": {"type": ["string", "integer"]},
-        "acceptable": {"type": "array", "minItems": 1, "items": {"type": ["string", "integer"]}}
+        "desired": {
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "acceptable": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": [
+              "string",
+              "integer"
+            ]
+          }
+        }
+      }
+    },
+    "commands": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
       }
     }
   }

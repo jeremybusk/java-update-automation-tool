@@ -1,4 +1,4 @@
-"""Command-line orchestration for the four-stage portfolio workflow."""
+"""Shared portfolio CLI and compatibility entry point for the original workflow."""
 
 from __future__ import annotations
 
@@ -26,8 +26,8 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("validate", help="validate configuration and repository associations")
     run = commands.add_parser("run", help="run one or more ordered stages")
     _selectors(run)
-    run.add_argument("--from", dest="from_stage", choices=STAGES, default=STAGES[0])
-    run.add_argument("--through", choices=STAGES, default=STAGES[2])
+    run.add_argument("--from", dest="from_stage", choices=STAGES[:4], default=STAGES[0])
+    run.add_argument("--through", choices=STAGES[:4], default=STAGES[2])
     run.add_argument("--refresh", action=argparse.BooleanOptionalAction, default=True,
                      help="fetch remote discovery checkouts before inspection")
     run.add_argument("--execute", action="store_true",
@@ -66,8 +66,16 @@ def _migration_policy(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def execute_migration(command: list[str]) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env.update({"GIT_AUTHOR_NAME": "Java Update Automation", "GIT_AUTHOR_EMAIL": "java-update@localhost",
+                "GIT_COMMITTER_NAME": "Java Update Automation", "GIT_COMMITTER_EMAIL": "java-update@localhost"})
+    return subprocess.run(command, cwd=Path(__file__).resolve().parents[1],
+                          text=True, env=env, check=False)
+
+
 def migration_stage(selected: Sequence[Any], portfolio: Any, config: dict[str, Any], state: Path,
-                    execute: bool) -> list[dict[str, Any]]:
+                    execute: bool, managed: bool = False) -> list[dict[str, Any]]:
     outputs: list[dict[str, Any]] = []
     policy = _migration_policy(config)
     recipe_repository = config.get("migration", {}).get("openrewrite", {}).get("recipe_repository", "maven-central")
@@ -83,14 +91,32 @@ def migration_stage(selected: Sequence[Any], portfolio: Any, config: dict[str, A
     for key in (key for wave in waves for key in wave):
         repo = by_key[key]
         plan_path = artifact_path(state, STAGES[2], "repositories", repo.key)
-        directory = artifact_path(state, STAGES[3], "repositories", repo.key).parent
+        result_path = artifact_path(state, STAGES[3], "repositories", repo.key)
+        if managed and result_path.exists():
+            existing = read_json(result_path)
+            if existing["status"] == "migrated":
+                statuses[repo.key] = "complete"
+                outputs.append(existing)
+                continue
+        directory = result_path.parent
         directory.mkdir(parents=True, exist_ok=True)
         policy_path = directory / "migration-policy.json"
         write_json(policy_path, policy)
         command = [sys.executable, str(Path(__file__).resolve().parents[1] / "migrate.py"), repo.source,
                    "--policy", str(policy_path), "--recipe-repository", recipe_repository,
                    "--output", str(directory / "worktree"), "--workspace", str(directory / "engine")]
-        command.append("--force")
+        if managed:
+            import uuid
+            command.append("--commit")
+            directory = directory / "attempts" / uuid.uuid4().hex[:8]
+            directory.mkdir(parents=True)
+            policy_path = directory / "migration-policy.json"
+            write_json(policy_path, policy)
+            command[command.index("--policy") + 1] = str(policy_path)
+            command[command.index("--output") + 1] = str(directory / "worktree")
+            command[command.index("--workspace") + 1] = str(directory / "engine")
+        else:
+            command.append("--force")
         if repo.ref:
             # The legacy JSON manifest is the only path that carries refs.
             manifest = directory / "repository.json"
@@ -109,13 +135,25 @@ def migration_stage(selected: Sequence[Any], portfolio: Any, config: dict[str, A
                 result.update({"status": "blocked", "blocked_by": blocked_by})
             else:
                 try:
-                    completed = subprocess.run(command, cwd=Path(__file__).resolve().parents[1],
-                                               text=True, env=os.environ.copy(), check=False)
+                    completed = execute_migration(command)
                     result.update({"executed": True, "exit_code": completed.returncode,
                                    "status": "complete" if completed.returncode == 0 else "failed"})
                 except OSError as exc:
                     result.update({"status": "failed", "error": str(exc)})
-        statuses[repo.key] = result["status"]
+        if managed:
+            import java_migrator as engine
+            result["output"] = str(directory / "worktree" / engine.destination_name(repo.source))
+            if result["status"] == "complete":
+                try:
+                    summary = read_json(directory / "engine" / "reports" / "summary.json")
+                    engine_results = summary.get("results", [])
+                    if engine_results and all(item["status"] in {"changed", "unchanged"} for item in engine_results):
+                        result["status"] = "migrated"
+                    else:
+                        result["status"] = "analyzed"
+                except PortfolioError as exc:
+                    result.update({"status": "failed", "error": str(exc)})
+        statuses[repo.key] = "complete" if result["status"] == "migrated" else result["status"]
         write_json(artifact_path(state, STAGES[3], "repositories", repo.key), result)
         outputs.append(result)
     for kind, field in (("applications", "application_id"),
@@ -133,7 +171,7 @@ def migration_stage(selected: Sequence[Any], portfolio: Any, config: dict[str, A
                 "status": ("failed" if any(item["status"] == "failed" for item in results) else
                            "blocked" if any(item["status"] == "blocked" for item in results) else
                            "incomplete-cohort" if not complete_cohort else
-                           "complete" if results and all(item["status"] == "complete" for item in results)
+                           "complete" if results and all(item["status"] in {"complete", "migrated"} for item in results)
                            else "planned"),
                 "results": [{"repository": item["repository"], "status": item["status"],
                              "executed": item["executed"]} for item in results],
@@ -143,7 +181,7 @@ def migration_stage(selected: Sequence[Any], portfolio: Any, config: dict[str, A
     return outputs
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def legacy_main(argv: Sequence[str] | None = None) -> int:
     try:
         args = parser().parse_args(argv)
         config = load_config(args.config.resolve())
@@ -209,3 +247,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (PortfolioError, OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    values = list(argv) if argv is not None else sys.argv[1:]
+    if "--legacy" in values:
+        values.remove("--legacy")
+        return legacy_main(values)
+    from .workflow import main as workflow_main
+    return workflow_main(values)

@@ -19,7 +19,7 @@ from typing import Any, Sequence
 import java_migrator as legacy
 
 
-STAGES = ("01-discovery", "02-assessment", "03-planning", "04-migration")
+STAGES = ("01-discovery", "02-assessment", "03-planning", "04-migration", "05-validation", "06-publishing")
 
 
 class PortfolioError(RuntimeError):
@@ -133,6 +133,15 @@ def load_portfolio(path: Path) -> Portfolio:
         duplicates = sorted(value for value, count in Counter(values).items() if count > 1)
         if duplicates:
             errors.append(f"duplicate {label}: {', '.join(duplicates)}")
+    aliases: dict[str, str] = {}
+    for repo in repositories:
+        for alias in (repo.key, repo.repo_name):
+            if alias in aliases and aliases[alias] != repo.key:
+                errors.append(f"ambiguous repository identifier: {alias}")
+            aliases[alias] = repo.key
+        for value in (repo.key, repo.repo_name, repo.application_id, repo.application_group_id):
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value) or value in {".", ".."}:
+                errors.append(f"unsafe artifact identifier: {value}")
     known = set(keys) | set(names)
     for repo in repositories:
         missing = sorted(set(repo.depends_on) - known)
@@ -453,8 +462,8 @@ def dependency_matrix(discoveries: Sequence[dict[str, Any]], config: dict[str, A
     for coordinate, repositories in sorted(matrix.items()):
         versions = sorted({version for values in repositories.values() for version in values})
         if len(repositories) > 1 and len(versions) > 1:
-            pin = next((str(value) for pattern, value in pins.items()
-                        if fnmatch.fnmatch(coordinate, pattern)), None)
+            from .policy import resolve_pin
+            pin = resolve_pin(coordinate, pins)
             mismatches.append({
                 "coordinate": coordinate, "severity": "error", "versions": versions,
                 "repositories": {key: sorted(values) for key, values in sorted(repositories.items())},
@@ -744,12 +753,44 @@ def markdown_for_migration(data: dict[str, Any]) -> str:
     if data.get("results"):
         lines += ["", "## Repository checklist", ""]
         for result in data["results"]:
-            lines.append(f"- [{'x' if result['status'] == 'complete' else ' '}] `{result['repository']}` — {result['status']}")
+            lines.append(f"- [{'x' if result['status'] in {'complete', 'migrated'} else ' '}] `{result['repository']}` — {result['status']}")
     else:
         lines += ["", "## Execution checklist", "",
                   f"- [{'x' if data.get('executed') else ' '}] Execute the generated migration command.",
-                  f"- [{'x' if data.get('status') == 'complete' else ' '}] Verify migration engine completion.",
+                  f"- [{'x' if data.get('status') in {'complete', 'migrated'} else ' '}] Verify migration engine completion.",
                   "- [ ] Rerun discovery and assessment for the complete application cohort."]
+    return "\n".join(lines) + "\n"
+
+
+def markdown_for_validation(data: dict[str, Any]) -> str:
+    if "cohort_complete" in data:
+        return markdown_for_assessment(data)
+    lines = [f"# Validation: {data['repository']}", "", "> Generated view. JSON is the source of truth.", "",
+             f"- Status: **{data['status']}**"]
+    for key in ("output", "commit", "tree_hash", "error"):
+        if key in data:
+            lines.append(f"- {key}: `{data[key]}`")
+    lines += ["", "## Required checks", ""]
+    for check in data.get("checks", []):
+        lines.append(f"- [{'x' if check['status'] == 'passed' else ' '}] {check['name']}: `{' '.join(check['command'])}`")
+    inventory = data.get("inventory", {})
+    if inventory:
+        lines += ["", f"- Effective Java: {', '.join(inventory['java_versions'])}",
+                  f"- Effective Spring Boot: {', '.join(inventory['spring_boot_versions']) or 'not applicable'}",
+                  f"- Resolved dependencies: {len(inventory['dependencies'])}"]
+    return "\n".join(lines) + "\n"
+
+
+def markdown_for_publishing(data: dict[str, Any]) -> str:
+    lines = [f"# Publishing: {data['repository']}", "", "> Generated view. JSON is the source of truth.", "",
+             f"- Status: **{data['status']}**", ""]
+    if data.get("error"):
+        lines.append(f"- Error: {data['error']}")
+    for name, target in data.get("targets", {}).items():
+        lines.append(f"- [{'x' if target['status'] == 'published' else ' '}] `{name}`: {target['status']}")
+        for key in ("url", "branch", "commit", "error"):
+            if key in target:
+                lines.append(f"  - {key}: `{target[key]}`")
     return "\n".join(lines) + "\n"
 
 
@@ -762,6 +803,7 @@ def render_reports(state: Path, selected: Sequence[Repository] | None = None) ->
     for stage, renderer in (
         (STAGES[0], markdown_for_discovery), (STAGES[1], markdown_for_assessment),
         (STAGES[2], markdown_for_plan), (STAGES[3], markdown_for_migration),
+        (STAGES[4], markdown_for_validation), (STAGES[5], markdown_for_publishing),
     ):
         root = state / stage
         if not root.exists():

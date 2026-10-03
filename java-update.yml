@@ -40,13 +40,62 @@ migration:
     commands: []
   openrewrite:
     # This recipe repository needs CODE_GENOME_USERNAME/CODE_GENOME_TOKEN.
-    # Clear recipes/artifacts and use maven-central for Java-only migrations.
+    # Recipes are derived from targets; leave this empty unless adding overrides.
+    # For Java-only migrations, clear artifacts and use maven-central.
     recipe_repository: codegenome
-    recipes:
-      - org.openrewrite.java.spring.boot4.UpgradeSpringBoot_4_0
+    recipes: []
     artifacts:
       - org.openrewrite.recipe:rewrite-migrate-java:3.45.0
       - org.openrewrite.recipe:rewrite-static-analysis:2.44.0
       - org.openrewrite.recipe:rewrite-java-dependencies:1.63.0
       - org.openrewrite.recipe:rewrite-testing-frameworks:3.47.0
       - org.openrewrite.recipe:rewrite-spring:6.40.0
+
+# Global orchestration defaults. Full examples and exit codes: notes/workflow.md.
+workflow:
+  mode: manual                      # manual | unattended; CLI: --mode
+  checkpoints:                      # Manual approval after these stages
+    - 01-discovery
+    - 02-assessment
+    - 03-planning
+    - 04-migration
+    - 05-validation
+    - 06-publishing
+  show_diffs: false                 # Compare retained source/policy/output runs
+  include_dependencies: false       # Expand selected depends_on recursively
+  allow_dependency_override: false  # Manual experiments only; blocks publication
+  dependency_evidence: {}           # repo_id: path/to/05-validation/.../result.json
+  allow_downgrades: false           # Permit lower dependency pins; still validate
+
+  validation:
+    build: test                     # test | compile; required for every build root
+    timeout: 3600                    # Seconds per build/inventory/custom command
+    commands: []                    # Global checks, argv lists; never shell strings
+    # commands: [["./scripts/contract-test.sh"], ["./scripts/integration-test.sh"]]
+    repositories: {}                # Extra checks: repo_id: {commands: [["..."]]}
+
+  publishing:
+    enabled: false                  # Explicit opt-in for selected remote targets
+    targets: [local_repo]           # local_repo, src_repo, dst_repo; any combination
+    history: default                # default branch ancestry | all branches/tags
+    independent_applications: false # Failed checks block the entire run by default
+    provider: github                # github | gitlab (creation/default branch API)
+    mode: autocreate                # autocreate stops on collisions | precreated
+    owner: ""                       # GitHub account/org or GitLab namespace path
+    prefix: ""                      # Set before autocreate, e.g. "java21-"
+    default_branch: main            # Destination/local default, including master→main
+    source_branch: "automation/java-{java}" # Source publishing branch
+    source_default_branch: null     # Explicit host default rename; retains old branch
+    private: true
+    namespace_id: null              # Optional GitLab namespace ID
+    api_url: null                   # Optional self-hosted API base URL, using HTTPS
+    token_env: null                 # GH_TOKEN/GITLAB_TOKEN by default; values stay in env
+    repositories: {}               # Per-repo overrides keyed by stable repo_id/name
+    # repositories:
+    #   orders-api:
+    #     mode: precreated
+    #     owner: acme
+    #     name: orders-api-modern
+    #   worker:
+    #     mode: precreated
+    #     url: git@github.com:acme/worker-modern.git

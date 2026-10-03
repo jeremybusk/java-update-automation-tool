@@ -394,6 +394,10 @@ def prepare_repo(
             raise MigrationError("output directory must not resolve to the input directory")
 
         excluded_top_level = set()
+        tracked_directories = set()
+        if (local / ".git").exists():
+            for name in capture(["git", "ls-files", "-z"], local).split("\0"):
+                tracked_directories.update(str(parent) for parent in Path(name).parents)
         for generated in (args.output, args.workspace):
             try:
                 relative = generated.relative_to(local)
@@ -403,12 +407,27 @@ def prepare_repo(
                 pass
 
         def ignore(directory: str, names: list[str]) -> set[str]:
-            ignored = {name for name in names if name in {"target", "build", ".gradle", "__pycache__"}}
+            relative = Path(directory).relative_to(local)
+            ignored = {name for name in names if name in {"target", "build", ".gradle", "__pycache__"}
+                       and str(relative / name) not in tracked_directories}
             if Path(directory).resolve() == local:
                 ignored.update(name for name in names if name in excluded_top_level)
             return ignored
 
-        shutil.copytree(local, path, symlinks=True, ignore=ignore)
+        if (local / ".git").is_file():
+            run(["git", "clone", "--no-hardlinks", str(local), str(path)], cwd=args.workspace,
+                env=env, log=log, timeout=args.timeout)
+        else:
+            shutil.copytree(local, path, symlinks=True, ignore=ignore)
+        if spec.ref:
+            if not (path / ".git").exists():
+                raise MigrationError("a local ref requires a Git repository")
+            try:
+                revision = capture(["git", "rev-parse", "--verify", f"{spec.ref}^{{commit}}"], path)
+            except MigrationError:
+                revision = capture(["git", "rev-parse", "--verify", f"origin/{spec.ref}^{{commit}}"], path)
+            run(["git", "checkout", "--detach", revision], cwd=path,
+                env=env, log=log, timeout=args.timeout)
         return path, False
     path.parent.mkdir(parents=True, exist_ok=True)
     git_env = dict(env)
@@ -426,7 +445,7 @@ def prepare_repo(
         display=shlex.join(safe_command))
     if spec.ref:
         # A separate fetch supports branch names, tags, and raw commit SHAs.
-        run(["git", "fetch", "--depth", "1", "origin", spec.ref], cwd=path,
+        run(["git", "fetch", *(["--depth", "1"] if args.shallow else []), "origin", spec.ref], cwd=path,
             env=git_env, log=log, timeout=args.timeout)
         run(["git", "checkout", "--detach", "FETCH_HEAD"], cwd=path,
             env=git_env, log=log, timeout=args.timeout)
@@ -493,7 +512,6 @@ def maven_dependencies(path: Path) -> list[Dependency]:
         root = ET.parse(path).getroot()
     except (ET.ParseError, OSError):
         return []
-    parents = {child: parent for parent in root.iter() for child in parent}
     properties: dict[str, str] = {}
     for node in root.iter():
         if local_name(node) == "properties":
@@ -503,24 +521,14 @@ def maven_dependencies(path: Path) -> list[Dependency]:
     for dependency in root.iter():
         if local_name(dependency) != "dependency":
             continue
-        ancestor = parents.get(dependency)
-        managed = False
-        while ancestor is not None:
-            if local_name(ancestor) == "dependencyManagement":
-                managed = True
-                break
-            ancestor = parents.get(ancestor)
-        if managed:
-            continue
         values = {local_name(child): (child.text or "").strip() for child in dependency}
         group, artifact, version = values.get("groupId", ""), values.get("artifactId", ""), values.get("version", "")
-        if not group or not artifact or not version:
+        if not group or not artifact:
             continue
         property_match = re.fullmatch(r"\$\{([^}]+)}", version)
         if property_match:
             version = properties.get(property_match.group(1), "")
-        if version and not version.startswith("${"):
-            result.append(Dependency(group, artifact, version, values.get("scope", "compile")))
+        result.append(Dependency(group, artifact, version or "unknown", values.get("scope", "compile")))
     return result
 
 
@@ -729,7 +737,7 @@ def artifacts(args: argparse.Namespace) -> list[str]:
         result.append(f"org.openrewrite.recipe:rewrite-static-analysis:{args.static_analysis_version}")
     if args.testing_modernization != "none":
         result.append(f"org.openrewrite.recipe:rewrite-testing-frameworks:{args.testing_frameworks_version}")
-    if args.dependency_strategy != "none":
+    if args.dependency_strategy != "none" or args.dependency_pin:
         result.append(f"org.openrewrite.recipe:rewrite-java-dependencies:{args.java_dependencies_version}")
     return result
 
@@ -750,8 +758,8 @@ def dependency_recipes(analysis: ProjectAnalysis, args: argparse.Namespace) -> l
         seen.add(coordinate)
         if any(fnmatch.fnmatch(coordinate, pattern) for pattern in args.dependency_deny):
             continue
-        pinned = next((version for pattern, version in args.dependency_pin.items()
-                       if fnmatch.fnmatch(coordinate, pattern)), None)
+        from java_update_tool.policy import resolve_pin
+        pinned = resolve_pin(coordinate, args.dependency_pin)
         if pinned is None and default_version is None:
             continue
         if pinned is None and dependency.group.startswith(coordinated_groups):

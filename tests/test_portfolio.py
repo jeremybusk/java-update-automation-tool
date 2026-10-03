@@ -8,7 +8,7 @@ from unittest.mock import patch
 import yaml
 
 from java_update_tool import core
-from java_update_tool.cli import main
+from java_update_tool.cli import legacy_main as main
 import java_migrator as legacy
 
 
