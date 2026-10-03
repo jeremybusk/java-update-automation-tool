@@ -106,6 +106,18 @@ python3 portfolio.py run --application orders \
 
 Running a single repository is intentionally valid, but its application/group assessment is marked `incomplete-cohort`. Use application or group scope for a final alignment decision.
 
+Stage 04 orders selected repositories into dependency waves using `depends_on`
+(repository IDs or names), including dependencies across applications. Execution
+rejects dependency cycles before starting any migration. A failed migration blocks
+its direct and transitive dependents; unrelated repositories continue. Dependencies
+outside the selected scope are not executed or checked.
+
+Migration failures return exit code `1` after writing results, Markdown reports,
+and a run receipt. Invalid inputs, missing plans, and dependency cycles return `2`.
+Preparation without `--execute` returns `0` and runs no migration commands.
+Configured `alignment.dependencies.pins` are passed to the engine as exact version
+pins, including with the conservative profile; report-only still performs no edits.
+
 ## Selectors
 
 Use one selector kind per run; each option is repeatable.

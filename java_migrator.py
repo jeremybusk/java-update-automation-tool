@@ -735,9 +735,7 @@ def artifacts(args: argparse.Namespace) -> list[str]:
 
 
 def dependency_recipes(analysis: ProjectAnalysis, args: argparse.Namespace) -> list[str]:
-    if args.dependency_strategy == "none":
-        return []
-    default_version = {"patch": "latest.patch", "latest": "latest.release"}[args.dependency_strategy]
+    default_version = {"patch": "latest.patch", "latest": "latest.release"}.get(args.dependency_strategy)
     coordinated_groups = (
         "org.springframework", "org.hibernate", "io.quarkus", "io.micronaut",
         "com.fasterxml.jackson", "junit", "org.junit", "org.mockito", "net.bytebuddy",
@@ -754,6 +752,8 @@ def dependency_recipes(analysis: ProjectAnalysis, args: argparse.Namespace) -> l
             continue
         pinned = next((version for pattern, version in args.dependency_pin.items()
                        if fnmatch.fnmatch(coordinate, pattern)), None)
+        if pinned is None and default_version is None:
+            continue
         if pinned is None and dependency.group.startswith(coordinated_groups):
             continue
         new_version = pinned or default_version

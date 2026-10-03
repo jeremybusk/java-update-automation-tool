@@ -569,6 +569,31 @@ def _task(task_id: str, text: str, *, status: str = "pending", details: Any = No
     return result
 
 
+def migration_waves(repositories: Sequence[Repository]) -> tuple[list[list[str]], list[str]]:
+    """Order selected repositories; dependencies outside the selection are out of scope."""
+    aliases = {alias: repo.key for repo in repositories for alias in (repo.key, repo.repo_name)}
+    dependencies = {
+        repo.key: {aliases[dep] for dep in repo.depends_on if dep in aliases}
+        for repo in repositories
+    }
+    remaining = set(dependencies)
+    completed: set[str] = set()
+    waves: list[list[str]] = []
+    ordering_issues: list[str] = []
+    while remaining:
+        ready = sorted(key for key in remaining if dependencies[key] <= completed)
+        if not ready:
+            ready = sorted(remaining)
+            ordering_issues.append(
+                "Dependency cycle detected among: " + ", ".join(ready)
+                + "; manual wave ordering is required."
+            )
+        waves.append(ready)
+        completed.update(ready)
+        remaining.difference_update(ready)
+    return waves, ordering_issues
+
+
 def plan(selected: Sequence[Repository], portfolio: Portfolio, config: dict[str, Any], state: Path) -> list[dict[str, Any]]:
     outputs: list[dict[str, Any]] = []
     for repo in selected:
@@ -607,25 +632,7 @@ def plan(selected: Sequence[Repository], portfolio: Portfolio, config: dict[str,
             members = [repo for repo in selected if getattr(repo, field) == key]
             assessment = read_json(artifact_path(state, STAGES[1], kind, key))
             member_keys = {repo.key for repo in members}
-            aliases = {alias: repo.key for repo in members for alias in (repo.key, repo.repo_name)}
-            waves: list[list[str]] = []
-            ordering_issues: list[str] = []
-            remaining = set(member_keys)
-            completed: set[str] = set()
-            while remaining:
-                ready = sorted(item for item in remaining if {
-                    aliases[dep] for dep in next(repo for repo in members if repo.key == item).depends_on
-                    if dep in aliases and aliases[dep] in member_keys
-                } <= completed)
-                if not ready:
-                    ready = sorted(remaining)
-                    ordering_issues.append(
-                        "Dependency cycle detected among: " + ", ".join(ready)
-                        + "; manual wave ordering is required."
-                    )
-                waves.append(ready)
-                completed.update(ready)
-                remaining.difference_update(ready)
+            waves, ordering_issues = migration_waves(members)
             tasks = [
                 _task("approve-targets", "Approve common Java, Spring Boot, and dependency targets."),
                 _task("migrate-waves", "Migrate repositories in dependency order, one wave at a time.",
@@ -728,6 +735,12 @@ def markdown_for_migration(data: dict[str, Any]) -> str:
              f"- Generated: `{data['generated_at']}`", f"- Status: **{data['status']}**"]
     if "cohort_complete" in data:
         lines.append(f"- Complete cohort: **{'yes' if data['cohort_complete'] else 'no'}**")
+    if data.get("blocked_by"):
+        lines.append("- Blocked by: " + ", ".join(f"`{key}`" for key in data["blocked_by"]))
+    if "exit_code" in data:
+        lines.append(f"- Engine exit code: `{data['exit_code']}`")
+    if data.get("error"):
+        lines.append(f"- Error: {data['error']}")
     if data.get("results"):
         lines += ["", "## Repository checklist", ""]
         for result in data["results"]:

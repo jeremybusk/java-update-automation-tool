@@ -12,7 +12,7 @@ from typing import Any, Sequence
 
 from .core import (
     STAGES, PortfolioError, artifact_path, assess, discover_repository, load_config,
-    load_portfolio, now, plan, read_json, render_reports, select_repositories,
+    load_portfolio, migration_waves, now, plan, read_json, render_reports, select_repositories,
     summarize_discoveries, validate_targets, write_json,
 )
 
@@ -57,6 +57,10 @@ def _migration_policy(config: dict[str, Any]) -> dict[str, Any]:
         "targetJava": int(config["targets"]["java"]["desired"]),
         "buildTool": config.get("discovery", {}).get("build_tool", "auto"),
         "recipes": rewrite.get("recipes", []), "artifacts": rewrite.get("artifacts", []),
+        "dependencies": {"pin": {
+            pattern: str(version)
+            for pattern, version in config.get("alignment", {}).get("dependencies", {}).get("pins", {}).items()
+        }},
         "verification": migration.get("verification", {"build": "test", "postChecks": "jdk", "strict": False}),
         "reporting": {"format": "both"},
     }
@@ -67,9 +71,18 @@ def migration_stage(selected: Sequence[Any], portfolio: Any, config: dict[str, A
     outputs: list[dict[str, Any]] = []
     policy = _migration_policy(config)
     recipe_repository = config.get("migration", {}).get("openrewrite", {}).get("recipe_repository", "maven-central")
+    waves, ordering_issues = migration_waves(selected)
+    if execute and ordering_issues:
+        raise PortfolioError("cannot execute migration:\n- " + "\n- ".join(ordering_issues))
+    by_key = {repo.key: repo for repo in selected}
+    aliases = {alias: repo.key for repo in selected for alias in (repo.key, repo.repo_name)}
+    statuses: dict[str, str] = {}
+    # Check all required plans before starting any migration.
     for repo in selected:
+        read_json(artifact_path(state, STAGES[2], "repositories", repo.key))
+    for key in (key for wave in waves for key in wave):
+        repo = by_key[key]
         plan_path = artifact_path(state, STAGES[2], "repositories", repo.key)
-        read_json(plan_path)
         directory = artifact_path(state, STAGES[3], "repositories", repo.key).parent
         directory.mkdir(parents=True, exist_ok=True)
         policy_path = directory / "migration-policy.json"
@@ -90,10 +103,19 @@ def migration_stage(selected: Sequence[Any], portfolio: Any, config: dict[str, A
             "inputs": {"plan": str(plan_path), "policy": str(policy_path)},
         }
         if execute:
-            completed = subprocess.run(command, cwd=Path(__file__).resolve().parents[1],
-                                       text=True, env=os.environ.copy(), check=False)
-            result.update({"executed": True, "exit_code": completed.returncode,
-                           "status": "complete" if completed.returncode == 0 else "failed"})
+            blocked_by = sorted({aliases[dep] for dep in repo.depends_on
+                                 if dep in aliases and statuses.get(aliases[dep]) != "complete"})
+            if blocked_by:
+                result.update({"status": "blocked", "blocked_by": blocked_by})
+            else:
+                try:
+                    completed = subprocess.run(command, cwd=Path(__file__).resolve().parents[1],
+                                               text=True, env=os.environ.copy(), check=False)
+                    result.update({"executed": True, "exit_code": completed.returncode,
+                                   "status": "complete" if completed.returncode == 0 else "failed"})
+                except OSError as exc:
+                    result.update({"status": "failed", "error": str(exc)})
+        statuses[repo.key] = result["status"]
         write_json(artifact_path(state, STAGES[3], "repositories", repo.key), result)
         outputs.append(result)
     for kind, field in (("applications", "application_id"),
@@ -108,8 +130,9 @@ def migration_stage(selected: Sequence[Any], portfolio: Any, config: dict[str, A
                 "schema_version": 1, "artifact_type": f"{kind[:-1]}-migration-result",
                 "stage": "04-migration", "generated_at": now(), "id": key,
                 "cohort_complete": complete_cohort,
-                "status": ("incomplete-cohort" if not complete_cohort else
-                           "failed" if any(item["status"] == "failed" for item in results) else
+                "status": ("failed" if any(item["status"] == "failed" for item in results) else
+                           "blocked" if any(item["status"] == "blocked" for item in results) else
+                           "incomplete-cohort" if not complete_cohort else
                            "complete" if results and all(item["status"] == "complete" for item in results)
                            else "planned"),
                 "results": [{"repository": item["repository"], "status": item["status"],
@@ -144,6 +167,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if start > end:
             raise PortfolioError("--from must not come after --through")
         stages = STAGES[start:end + 1]
+        exit_code = 0
         discoveries: list[dict[str, Any]] = []
         if STAGES[0] in stages:
             for repo in selected:
@@ -163,14 +187,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"[{STAGES[2]}] wrote {len(results)} plan artifact(s)")
         if STAGES[3] in stages:
             results = migration_stage(selected, portfolio, config, state, args.execute)
-            print(f"[{STAGES[3]}] {'executed' if args.execute else 'planned'} {len(selected)} repository migration(s)")
+            if args.execute and any(item["status"] in {"failed", "blocked"} for item in results):
+                exit_code = 1
+            if args.execute:
+                repository_results = [item for item in results if "repository" in item]
+                executed = sum(item["executed"] for item in repository_results)
+                failed = sum(item["status"] == "failed" for item in repository_results)
+                blocked = sum(item["status"] == "blocked" for item in repository_results)
+                print(f"[{STAGES[3]}] executed {executed} repository migration(s); "
+                      f"{failed} failed, {blocked} blocked")
+            else:
+                print(f"[{STAGES[3]}] planned {len(selected)} repository migration(s)")
         reports = render_reports(state, selected)
         run_record = {
             "schema_version": 1, "generated_at": now(), "selected": [repo.key for repo in selected],
             "stages": list(stages), "execute": args.execute, "reports": [str(path) for path in reports],
+            "exit_code": exit_code,
         }
         write_json(state / "runs" / f"{run_record['generated_at'].replace(':', '-')}.json", run_record)
-        return 0
+        return exit_code
     except (PortfolioError, OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
