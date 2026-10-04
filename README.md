@@ -72,4 +72,4 @@ python3 -B -m unittest discover -s tests -v
 
 Normal tests use temporary Git repositories, deterministic migration/build boundaries, and local fake hosting APIs. The opt-in integration matrix covers Maven/Gradle Java 17→21 and 8→25, BOMs, multi-project builds, catalogs, and Spring Boot 3.4→3.5→4.0. GitHub CI runs authenticated Boot checks with `CODE_GENOME_USERNAME` and `CODE_GENOME_TOKEN` secrets on trusted jobs; missing prerequisites fail required checks. See the workflow guide for the precise fixture and toolchain matrix.
 
-`migrate.py` remains available for direct OpenRewrite execution. `portfolio.py --legacy` preserves the previous four-stage state layout and command behavior. The reusable [report skill](skills/java-update-reports/SKILL.md) regenerates Markdown from retained JSON.
+`migrate.py` remains available for direct OpenRewrite execution. `portfolio.py` uses the six-stage workflow exclusively. The reusable [report skill](skills/java-update-reports/SKILL.md) regenerates Markdown from retained JSON.

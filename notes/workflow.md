@@ -1,6 +1,6 @@
 # Reviewed validation and publishing
 
-The six stages use a retained run rather than replacing earlier state. `java-update.yml` contains commented defaults, and `repositories.yml` defines stable repository keys, application/group membership, requested refs, and dependencies. Paths in the portfolio resolve relative to that file. Workflow evidence paths resolve relative to the invocation directory.
+The six stages use a retained run rather than replacing earlier state. The obsolete `--legacy` and `--refresh` options have been removed. `java-update.yml` contains commented defaults, and `repositories.yml` defines stable repository keys, application/group membership, requested refs, and dependencies. Paths in the portfolio resolve relative to that file. Workflow evidence paths resolve relative to the invocation directory.
 
 ## Defaults and CLI overrides
 
@@ -23,7 +23,7 @@ workflow:
 
 CLI overrides: `--mode manual|unattended`, `--[no-]show-diffs`, `--[no-]include-dependencies`, `--[no-]dependency-override`, `--[no-]enable-publishing`, and repeatable `--publish-target local_repo|src_repo|dst_repo`. They become part of the saved run; provide the same overrides on resume. `--execute` authorizes migration/publication execution and can be added after preparing commands.
 
-A new invocation without `--resume` creates a separate run. `--from STAGE` reruns that stage and downstream requested stages in a saved run. Successful repository migrations and publishing target receipts are reused; failed migration attempts are kept in unique directories. To migrate new source content or change policy, create a new run.
+A new invocation without `--resume` creates a separate run. `--from STAGE` reruns that stage and downstream requested stages in a saved run. Successful repository migrations and publishing target receipts are reused; failed migration attempts are kept in unique directories. To migrate new source content or change policy, create a new run. The report script reads retained runs using `--run-id` (default: `latest`).
 
 ## Retained resources and reviews
 
@@ -150,7 +150,7 @@ python3 -B -m unittest discover -s tests -v
 JAVA_UPDATE_INTEGRATION=1 python3 -B -m unittest discover -s tests -p test_integration.py -v
 ```
 
-Normal tests use actual temporary Git histories and fake migration/build/provider boundaries, without external publication. Integration tests run real transformations, builds, effective inventories, and local publication. They skip without explicit opt-in; once enabled, missing tools or credentials fail. Use `portfolio.py --legacy` for previous four-stage invocations/state; legacy JSON is not imported as approved six-stage evidence.
+Normal tests use actual temporary Git histories and fake migration/build/provider boundaries, without external publication. Integration tests run real transformations, builds, effective inventories, and local publication. They skip without explicit opt-in; once enabled, missing tools or credentials fail.
 # Hardened validation and retained-run operations
 
 Omitted Git refs select the source default branch consistently. Local repositories

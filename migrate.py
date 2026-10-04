@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compatibility entry point for the Java migration CLI."""
+"""Direct entry point for OpenRewrite Java migrations."""
 
 from java_migrator import main
 

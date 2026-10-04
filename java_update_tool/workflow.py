@@ -1,7 +1,6 @@
 """Six-stage, resumable portfolio command-line workflow."""
 from __future__ import annotations
 
-import argparse
 import copy
 import contextlib
 import sys
@@ -16,39 +15,6 @@ from .validation import validate_stage
 from .publishing import publish_stage
 from .operations import lock, session, event, versions, redact
 from .maintenance import export_evidence, prune
-
-
-def parser() -> argparse.ArgumentParser:
-    result = cli.parser()
-    commands = next(action for action in result._actions if isinstance(action, argparse._SubParsersAction))
-    run = commands.choices["run"]
-    for action in run._actions:
-        if action.dest in {"from_stage", "through"}:
-            action.choices = STAGES
-    run.set_defaults(from_stage=None)
-    run.add_argument("--resume", metavar="RUN_ID", help="resume a retained run; use latest for the most recent")
-    run.add_argument("--mode", choices=("manual", "unattended"))
-    run.add_argument("--show-diffs", action=argparse.BooleanOptionalAction, default=None)
-    run.add_argument("--include-dependencies", action=argparse.BooleanOptionalAction, default=None)
-    run.add_argument("--dependency-override", action=argparse.BooleanOptionalAction, default=None)
-    run.add_argument("--enable-publishing", action=argparse.BooleanOptionalAction, default=None)
-    run.add_argument("--publish-target", action="append", choices=("local_repo", "src_repo", "dst_repo"))
-    run.add_argument("--source-selection", choices=("default", "current"))
-    run.add_argument("--draft-request", action=argparse.BooleanOptionalAction, default=None)
-    commands.choices["report"].add_argument("--run-id", default="latest")
-    approval = commands.add_parser("approve", help="approve an unchanged completed stage")
-    approval.add_argument("run_id")
-    approval.add_argument("--stage", choices=STAGES, required=True)
-    commands.add_parser("runs", help="list retained runs")
-    diff = commands.add_parser("diff", help="compare source, output, and policy between runs")
-    diff.add_argument("run_id")
-    diff.add_argument("--compare-to", required=True)
-    export = commands.add_parser("export-evidence", help="export redacted, portable inspection evidence")
-    export.add_argument("run_id")
-    export.add_argument("--output", type=Path, required=True)
-    cleanup = commands.add_parser("prune", help="inspect retained-run cleanup; dry-run unless --apply")
-    cleanup.add_argument("--apply", action="store_true")
-    return result
 
 
 def expand_dependencies(selected: list[Any], portfolio: Any) -> list[Any]:
@@ -151,7 +117,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     executing = False
     stack = contextlib.ExitStack()
     try:
-        args = parser().parse_args(argv)
+        args = cli.parser().parse_args(argv)
         state = args.state.resolve()
         if args.command == "prune":
             options = workflow_policy(load_config(args.config.resolve()))
@@ -267,7 +233,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             write_json(root / "run.json", current)
             if index == 0:
                 for repo in sources:
-                    data = discover_repository(repo, config, root, False)
+                    data = discover_repository(repo, config)
                     write_json(artifact_path(root, stage, "repositories", repo.key), data)
                     discoveries.append(data)
                 summarize_discoveries(sources, source_portfolio, discoveries, root)
@@ -283,7 +249,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     outputs = plan(sources, source_portfolio, config, root)
                 elif index == 3:
                     dependencies_ready(selected, portfolio, options, root)
-                    outputs = cli.migration_stage(sources, source_portfolio, read_json(root / "planned-policy.json"), root, args.execute, managed=True)
+                    outputs = cli.migration_stage(sources, source_portfolio, read_json(root / "planned-policy.json"), root, args.execute)
                 elif index == 4:
                     outputs = validate_stage(selected, portfolio, config, options, root)
                 else:

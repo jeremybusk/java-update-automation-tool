@@ -1,5 +1,7 @@
 import json
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,8 +10,9 @@ from unittest.mock import patch
 import yaml
 
 from java_update_tool import core
-from java_update_tool.cli import legacy_main as main
-import java_migrator as legacy
+from java_update_tool.cli import main
+from java_update_tool.runs import git, run_directory
+import java_migrator as engine
 
 
 CONFIG = """\
@@ -30,6 +33,9 @@ migration:
   profile: report-only
   openrewrite:
     recipe_repository: maven-central
+    artifacts: ['org.openrewrite.recipe:rewrite-spring:6.40.0']
+workflow:
+  mode: unattended
 """
 
 
@@ -95,6 +101,7 @@ repositories:
             "--state", str(state), "run", "--application", "orders",
         ])
         self.assertEqual(0, status)
+        state = self._run_root()
         discovery = json.loads((state / "01-discovery/repositories/api-id/result.json").read_text())
         self.assertEqual(["17"], discovery["summary"]["java_versions"])
         self.assertEqual(["3.4.2"], discovery["summary"]["spring_boot_versions"])
@@ -114,9 +121,9 @@ repositories:
         common = ["--config", str(self.root / "config.yml"), "--portfolio", str(self.root / "repos.yml"),
                   "--state", str(state)]
         self.assertEqual(0, main(common + ["run", "--application", "orders", "--through", "01-discovery"]))
-        self.assertEqual(0, main(common + ["run", "--application", "orders", "--from", "02-assessment",
+        self.assertEqual(0, main(common + ["run", "--resume", "latest", "--application", "orders", "--from", "02-assessment",
                                            "--through", "03-planning"]))
-        self.assertTrue((state / "03-planning/repositories/worker/plan.json").is_file())
+        self.assertTrue((self._run_root() / "03-planning/repositories/worker/plan.json").is_file())
 
     def test_invalid_cross_group_application_is_rejected(self):
         content = (self.root / "repos.yml").read_text().replace(
@@ -126,14 +133,19 @@ repositories:
         with self.assertRaises(core.PortfolioError):
             core.load_portfolio(path)
 
+    def _run_root(self):
+        return run_directory(self.root / "state")
+
     def _run(self, *arguments):
+        if "--from" in arguments:
+            arguments = ("--resume", "latest", *arguments)
         return main([
             "--config", str(self.root / "config.yml"), "--portfolio", str(self.root / "repos.yml"),
             "--state", str(self.root / "state"), "run", *arguments,
         ])
 
     def _migration_result(self, key, kind="repositories"):
-        return core.read_json(core.artifact_path(self.root / "state", "04-migration", kind, key))
+        return core.read_json(core.artifact_path(self._run_root(), "04-migration", kind, key))
 
     def _change_repositories(self, change):
         path = self.root / "repos.yml"
@@ -141,18 +153,34 @@ repositories:
         change(data["repositories"])
         path.write_text(yaml.safe_dump(data), encoding="utf-8")
 
+    def _fake_migration(self, command):
+        source = Path(command[2])
+        output = Path(command[command.index("--output") + 1]) / source.name
+        output.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, output)
+        pom = output / "pom.xml"
+        pom.write_text(pom.read_text().replace(">17<", ">21<").replace("3.4.2", "3.5.1").replace("1.0.0", "2.0.0"))
+        git(output, "add", "--all")
+        git(output, "commit", "-m", "Migrate build")
+        workspace = Path(command[command.index("--workspace") + 1])
+        core.write_json(workspace / "reports/summary.json", {"results": [{"status": "changed"}]})
+        return subprocess.CompletedProcess(command, 0)
+
     def _execute_stage_four(self):
         return self._run("--from", "04-migration", "--through", "04-migration", "--execute")
 
     def test_stage_four_preparation_does_not_execute_and_passes_pins(self):
         self.assertEqual(0, self._run())
-        with patch("java_update_tool.cli.subprocess.run") as run:
+        with patch("java_update_tool.cli.execute_migration") as run:
             self.assertEqual(0, self._run("--from", "04-migration", "--through", "04-migration"))
         run.assert_not_called()
         for key in ("api-id", "worker"):
             result = self._migration_result(key)
             self.assertEqual("planned", result["status"])
             self.assertFalse(result["executed"])
+            self.assertIn("--commit", result["command"])
+            self.assertNotIn("--force", result["command"])
+            self.assertIn("attempts", Path(result["inputs"]["policy"]).parts)
             policy = core.read_json(Path(result["inputs"]["policy"]))
             self.assertEqual({"org.example:shared": "2.0.0"}, policy["dependencies"]["pin"])
 
@@ -163,12 +191,12 @@ repositories:
                 path.write_text(CONFIG.replace("profile: report-only", f"profile: {profile}"), encoding="utf-8")
                 self.assertEqual(0, self._run("--through", "04-migration"))
                 result = self._migration_result("api-id")
-                args = legacy.parse_args(["example", "--policy", result["inputs"]["policy"]])
-                analysis = legacy.ProjectAnalysis(dependencies=[
-                    legacy.Dependency("org.example", "shared", "1.0.0"),
-                    legacy.Dependency("org.example", "unpinned", "1.0.0"),
+                args = engine.parse_args(["example", "--policy", result["inputs"]["policy"]])
+                analysis = engine.ProjectAnalysis(dependencies=[
+                    engine.Dependency("org.example", "shared", "1.0.0"),
+                    engine.Dependency("org.example", "unpinned", "1.0.0"),
                 ])
-                recipes = "\n".join(legacy.dependency_recipes(analysis, args))
+                recipes = "\n".join(engine.dependency_recipes(analysis, args))
                 self.assertIn('artifactId: "shared"', recipes)
                 self.assertIn('newVersion: "2.0.0"', recipes)
                 if profile == "conservative":
@@ -180,13 +208,13 @@ repositories:
             repositories.reverse()
         self._change_repositories(reverse_with_alias)
         self.assertEqual(0, self._run())
-        with patch("java_update_tool.cli.subprocess.run",
-                   return_value=subprocess.CompletedProcess([], 0)) as run:
+        with patch("java_update_tool.cli.execute_migration",
+                   side_effect=self._fake_migration) as run:
             self.assertEqual(0, self._execute_stage_four())
-        self.assertEqual(["api", "worker"], [Path(call.args[0][2]).name for call in run.call_args_list])
+        self.assertEqual(["api-id", "worker"], [Path(call.args[0][2]).name for call in run.call_args_list])
         for key in ("api-id", "worker"):
             result = self._migration_result(key)
-            self.assertEqual("complete", result["status"])
+            self.assertEqual("migrated", result["status"])
             self.assertTrue(result["executed"])
         self.assertEqual("complete", self._migration_result("orders", "applications")["status"])
 
@@ -202,9 +230,11 @@ repositories:
             repositories.reverse()
         self._change_repositories(add_repositories)
         self.assertEqual(0, self._run())
-        with patch("java_update_tool.cli.subprocess.run", side_effect=[
-            subprocess.CompletedProcess([], 7), subprocess.CompletedProcess([], 0),
-        ]) as run:
+        def fail_api(command):
+            if Path(command[2]).name == "api-id":
+                return subprocess.CompletedProcess(command, 7)
+            return self._fake_migration(command)
+        with patch("java_update_tool.cli.execute_migration", side_effect=fail_api) as run:
             self.assertEqual(1, self._execute_stage_four())
         self.assertEqual(2, run.call_count)
         api = self._migration_result("api-id")
@@ -215,52 +245,49 @@ repositories:
             self.assertEqual("blocked", result["status"])
             self.assertFalse(result["executed"])
             self.assertEqual([dependency], result["blocked_by"])
-        self.assertEqual("complete", self._migration_result("independent")["status"])
+        self.assertEqual("migrated", self._migration_result("independent")["status"])
         self.assertEqual("blocked", self._migration_result("jobs", "applications")["status"])
         self.assertEqual("failed", self._migration_result("commerce", "application-groups")["status"])
-        state = self.root / "state"
+        state = self._run_root()
         failure_report = (state / "reports/04-migration/repositories/api-id/result.md").read_text()
         self.assertIn("Engine exit code: `7`", failure_report)
         blocked_report = (state / "reports/04-migration/repositories/worker/result.md").read_text()
         self.assertIn("Blocked by: `api-id`", blocked_report)
-        receipts = [core.read_json(path) for path in (state / "runs").glob("*.json")]
-        self.assertTrue(any(record.get("exit_code") == 1 for record in receipts))
+        self.assertEqual(1, core.read_json(state / "run.json")["exit_code"])
 
     def test_stage_four_partial_cohort_failure_returns_nonzero(self):
         self.assertEqual(0, self._run("--repo", "api-id"))
-        with patch("java_update_tool.cli.subprocess.run", return_value=subprocess.CompletedProcess([], 1)):
+        with patch("java_update_tool.cli.execute_migration", return_value=subprocess.CompletedProcess([], 1)):
             self.assertEqual(1, self._run("--repo", "api-id", "--from", "04-migration",
                                          "--through", "04-migration", "--execute"))
         summary = self._migration_result("orders", "applications")
         self.assertFalse(summary["cohort_complete"])
         self.assertEqual("failed", summary["status"])
 
-    def test_stage_four_single_repo_does_not_require_unselected_dependency(self):
+    def test_stage_four_unselected_dependency_requires_validation_evidence(self):
         self.assertEqual(0, self._run("--repo", "worker"))
-        with patch("java_update_tool.cli.subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as run:
-            self.assertEqual(0, self._run("--repo", "worker", "--from", "04-migration",
+        with patch("java_update_tool.cli.execute_migration") as run:
+            self.assertEqual(2, self._run("--repo", "worker", "--from", "04-migration",
                                          "--through", "04-migration", "--execute"))
-        run.assert_called_once()
-        self.assertEqual("complete", self._migration_result("worker")["status"])
-        self.assertEqual("incomplete-cohort", self._migration_result("orders", "applications")["status"])
+        run.assert_not_called()
 
     def test_stage_four_cycle_is_rejected_before_execution(self):
         self._change_repositories(lambda repositories: repositories[0].update(depends_on=["worker"]))
         self.assertEqual(0, self._run())
-        with patch("java_update_tool.cli.subprocess.run") as run:
+        with patch("java_update_tool.cli.execute_migration") as run:
             self.assertEqual(2, self._execute_stage_four())
         run.assert_not_called()
 
     def test_stage_four_missing_plan_is_rejected_before_execution(self):
         self.assertEqual(0, self._run())
-        core.artifact_path(self.root / "state", "03-planning", "repositories", "worker").unlink()
-        with patch("java_update_tool.cli.subprocess.run") as run:
+        core.artifact_path(self._run_root(), "03-planning", "repositories", "worker").unlink()
+        with patch("java_update_tool.cli.execute_migration") as run:
             self.assertEqual(2, self._execute_stage_four())
         run.assert_not_called()
 
     def test_stage_four_launch_failure_is_recorded_and_blocks_dependents(self):
         self.assertEqual(0, self._run())
-        with patch("java_update_tool.cli.subprocess.run", side_effect=OSError("cannot launch engine")) as run:
+        with patch("java_update_tool.cli.execute_migration", side_effect=OSError("cannot launch engine")) as run:
             self.assertEqual(1, self._execute_stage_four())
         run.assert_called_once()
         result = self._migration_result("api-id")
@@ -268,6 +295,44 @@ repositories:
         self.assertFalse(result["executed"])
         self.assertEqual("cannot launch engine", result["error"])
         self.assertEqual("blocked", self._migration_result("worker")["status"])
+
+    def test_removed_options_are_rejected_before_creating_state(self):
+        entry = Path(__file__).resolve().parents[1] / "portfolio.py"
+        for arguments in (["--legacy", "validate"], ["run", "--refresh"], ["run", "--no-refresh"]):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run([sys.executable, "-B", str(entry), "--state", str(self.root / "state"),
+                                         *arguments], capture_output=True, text=True)
+                self.assertEqual(2, result.returncode, result.stderr)
+                self.assertIn("unrecognized arguments", result.stderr)
+                self.assertFalse((self.root / "state").exists())
+
+    def test_report_script_renders_retained_runs_by_latest_or_explicit_id(self):
+        self.assertEqual(0, self._run())
+        root = self._run_root()
+        script = Path(__file__).resolve().parents[1] / "scripts/render_reports.py"
+        markdown = root / "reports/03-planning/repositories/api-id/plan.md"
+        for run_id in ("latest", root.name):
+            with self.subTest(run_id=run_id):
+                markdown.unlink()
+                result = subprocess.run([sys.executable, "-B", str(script), "--state", str(self.root / "state"),
+                                         "--run-id", run_id], capture_output=True, text=True)
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertTrue(markdown.is_file())
+                self.assertIn(str(root / "reports"), result.stdout)
+
+    def test_report_script_rejects_flat_state_without_modifying_artifacts(self):
+        state = self.root / "flat-state"
+        artifact = core.artifact_path(state, "01-discovery", "repositories", "api-id")
+        core.write_json(artifact, {"schema_version": 1, "stage": "01-discovery", "status": "complete"})
+        original = artifact.read_bytes()
+        script = Path(__file__).resolve().parents[1] / "scripts/render_reports.py"
+        result = subprocess.run([sys.executable, "-B", str(script), "--state", str(state)],
+                                capture_output=True, text=True)
+        self.assertEqual(2, result.returncode, result.stderr)
+        self.assertIn("error:", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse((state / "reports").exists())
+        self.assertEqual(original, artifact.read_bytes())
 
 
 if __name__ == "__main__":

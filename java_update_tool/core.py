@@ -9,15 +9,13 @@ import hashlib
 import json
 import os
 import re
-import stat
-import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Sequence
 
-import java_migrator as legacy
+import java_migrator as engine
 
 
 STAGES = ("01-discovery", "02-assessment", "03-planning", "04-migration", "05-validation", "06-publishing")
@@ -117,8 +115,8 @@ def load_portfolio(path: Path) -> Portfolio:
         if not isinstance(depends_on, list) or not all(isinstance(item, str) for item in depends_on):
             errors.append(f"{label}.depends_on must be a list of repository ids/names")
             depends_on = []
-        source = legacy.sanitized_url(str(raw["source"]))
-        if not legacy.is_remote(source):
+        source = engine.sanitized_url(str(raw["source"]))
+        if not engine.is_remote(source):
             source = str((path.parent / source).resolve()) if not Path(source).is_absolute() else source
         repositories.append(Repository(
             repo_name=raw["repo_name"].strip(), source=source,
@@ -219,59 +217,6 @@ def read_json(path: Path) -> dict[str, Any]:
     return data
 
 
-def _command(command: Sequence[str], cwd: Path, *, timeout: int = 300,
-             env: dict[str, str] | None = None) -> str:
-    try:
-        result = subprocess.run(command, cwd=cwd, env=env, text=True, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, timeout=timeout, check=True)
-        return result.stdout.strip()
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        detail = getattr(exc, "stderr", "") or ""
-        raise PortfolioError(f"command failed: {' '.join(command)}: {str(detail).strip()}") from exc
-
-
-def prepare_discovery_source(repo: Repository, state: Path, refresh: bool) -> Path:
-    if not legacy.is_remote(repo.source):
-        path = Path(repo.source).expanduser().resolve()
-        if not path.is_dir():
-            raise PortfolioError(f"local repository does not exist: {path}")
-        return path
-    checkout = state / "repositories" / repo.key
-    cloned = False
-    git_env = os.environ.copy()
-    git_env["GIT_TERMINAL_PROMPT"] = "0"
-    if git_env.get("GIT_TOKEN"):
-        askpass = state / ".git-askpass.sh"
-        if not askpass.exists():
-            askpass.parent.mkdir(parents=True, exist_ok=True)
-            askpass.write_text(
-                "#!/bin/sh\ncase \"$1\" in\n"
-                "*sername*) printf '%s\\n' \"${MIGRATOR_GIT_USERNAME:-x-access-token}\" ;;\n"
-                "*) printf '%s\\n' \"${MIGRATOR_GIT_TOKEN:-}\" ;;\nesac\n",
-                encoding="utf-8",
-            )
-            askpass.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
-        git_env.update({"GIT_ASKPASS": str(askpass), "MIGRATOR_GIT_TOKEN": git_env["GIT_TOKEN"],
-                        "MIGRATOR_GIT_USERNAME": git_env.get("GIT_USERNAME", "x-access-token")})
-    if not checkout.exists():
-        checkout.parent.mkdir(parents=True, exist_ok=True)
-        command = ["git", "clone", "--no-tags", repo.source, str(checkout)]
-        _command(command, state, env=git_env)
-        cloned = True
-    elif not (checkout / ".git").is_dir():
-        raise PortfolioError(f"managed checkout is not a Git repository: {checkout}")
-    if refresh:
-        _command(["git", "fetch", "--prune", "origin"], checkout, env=git_env)
-    if repo.ref:
-        if refresh or cloned:
-            _command(["git", "fetch", "origin", repo.ref], checkout, env=git_env)
-        _command(["git", "checkout", "--detach", "FETCH_HEAD"], checkout)
-    elif refresh:
-        remote_head = _command(["git", "symbolic-ref", "refs/remotes/origin/HEAD"], checkout)
-        _command(["git", "checkout", "--detach", remote_head], checkout)
-    return checkout
-
-
 def _local_name(node: ET.Element) -> str:
     return node.tag.rsplit("}", 1)[-1]
 
@@ -332,8 +277,12 @@ def inspect_gradle(build: Path) -> tuple[set[str], set[str]]:
     return java, spring
 
 
-def discover_repository(repo: Repository, config: dict[str, Any], state: Path, refresh: bool) -> dict[str, Any]:
-    path = prepare_discovery_source(repo, state, refresh)
+def discover_repository(repo: Repository, config: dict[str, Any]) -> dict[str, Any]:
+    """Inspect a local source snapshot or migrated worktree owned by a retained run."""
+    from .runs import command as run_command
+    path = Path(repo.source).expanduser().resolve()
+    if not path.is_dir():
+        raise PortfolioError(f"local repository does not exist: {path}")
     git: dict[str, Any] = {"is_git_repository": (path / ".git").exists()}
     if git["is_git_repository"]:
         for key, command in {
@@ -343,24 +292,24 @@ def discover_repository(repo: Repository, config: dict[str, Any], state: Path, r
             "dirty": ["git", "status", "--porcelain"],
         }.items():
             try:
-                value = _command(command, path, timeout=60)
+                value = run_command(command, path, timeout=60)
                 git[key] = bool(value) if key == "dirty" else value
             except PortfolioError:
                 git[key] = None
     requested_tool = config.get("discovery", {}).get("build_tool", "auto")
     max_depth = int(config.get("discovery", {}).get("max_depth", 5))
     try:
-        roots = legacy.discover_builds(path, requested_tool, max_depth)
-    except legacy.MigrationError:
+        roots = engine.discover_builds(path, requested_tool, max_depth)
+    except engine.MigrationError:
         roots = []
     projects: list[dict[str, Any]] = []
     all_java: set[str] = set()
     all_spring: set[str] = set()
     all_dependencies: list[dict[str, str]] = []
-    analysis_args = type("AnalysisArgs", (), {"exclusions": tuple(legacy.DEFAULT_EXCLUSIONS)})()
+    analysis_args = type("AnalysisArgs", (), {"exclusions": tuple(engine.DEFAULT_EXCLUSIONS)})()
     for root in roots:
         java, spring = inspect_maven(root.path) if root.tool == "maven" else inspect_gradle(root.path)
-        analysis = legacy.analyze_project(root, analysis_args)
+        analysis = engine.analyze_project(root, analysis_args)
         dependencies = [dataclasses.asdict(item) | {"coordinate": item.coordinate}
                         for item in analysis.dependencies]
         relative = str(root.path.relative_to(path)) or "."

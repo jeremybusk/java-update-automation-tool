@@ -1,19 +1,18 @@
-"""Shared portfolio CLI and compatibility entry point for the original workflow."""
+"""Public CLI and migration execution for the six-stage portfolio workflow."""
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Sequence
 
 from .core import (
-    STAGES, PortfolioError, artifact_path, assess, discover_repository, load_config,
-    load_portfolio, migration_waves, now, plan, read_json, render_reports, select_repositories,
-    summarize_discoveries, validate_targets, write_json,
+    STAGES, PortfolioError, artifact_path, migration_waves, now, read_json,
+    select_repositories, write_json,
 )
 
 
@@ -26,14 +25,34 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("validate", help="validate configuration and repository associations")
     run = commands.add_parser("run", help="run one or more ordered stages")
     _selectors(run)
-    run.add_argument("--from", dest="from_stage", choices=STAGES[:4], default=STAGES[0])
-    run.add_argument("--through", choices=STAGES[:4], default=STAGES[2])
-    run.add_argument("--refresh", action=argparse.BooleanOptionalAction, default=True,
-                     help="fetch remote discovery checkouts before inspection")
+    run.add_argument("--from", dest="from_stage", choices=STAGES)
+    run.add_argument("--through", choices=STAGES, default=STAGES[2])
     run.add_argument("--execute", action="store_true",
                      help="execute stage 04 with the existing OpenRewrite migration engine")
     report = commands.add_parser("report", help="regenerate Markdown solely from JSON artifacts")
     _selectors(report)
+    run.add_argument("--resume", metavar="RUN_ID", help="resume a retained run; use latest for the most recent")
+    run.add_argument("--mode", choices=("manual", "unattended"))
+    run.add_argument("--show-diffs", action=argparse.BooleanOptionalAction, default=None)
+    run.add_argument("--include-dependencies", action=argparse.BooleanOptionalAction, default=None)
+    run.add_argument("--dependency-override", action=argparse.BooleanOptionalAction, default=None)
+    run.add_argument("--enable-publishing", action=argparse.BooleanOptionalAction, default=None)
+    run.add_argument("--publish-target", action="append", choices=("local_repo", "src_repo", "dst_repo"))
+    run.add_argument("--source-selection", choices=("default", "current"))
+    run.add_argument("--draft-request", action=argparse.BooleanOptionalAction, default=None)
+    report.add_argument("--run-id", default="latest")
+    approval = commands.add_parser("approve", help="approve an unchanged completed stage")
+    approval.add_argument("run_id")
+    approval.add_argument("--stage", choices=STAGES, required=True)
+    commands.add_parser("runs", help="list retained runs")
+    diff = commands.add_parser("diff", help="compare source, output, and policy between runs")
+    diff.add_argument("run_id")
+    diff.add_argument("--compare-to", required=True)
+    export = commands.add_parser("export-evidence", help="export redacted, portable inspection evidence")
+    export.add_argument("run_id")
+    export.add_argument("--output", type=Path, required=True)
+    cleanup = commands.add_parser("prune", help="inspect retained-run cleanup; dry-run unless --apply")
+    cleanup.add_argument("--apply", action="store_true")
     return result
 
 
@@ -71,16 +90,16 @@ def execute_migration(command: list[str]) -> subprocess.CompletedProcess[str]:
     env.update({"GIT_AUTHOR_NAME": "Java Update Automation", "GIT_AUTHOR_EMAIL": "java-update@localhost",
                 "GIT_COMMITTER_NAME": "Java Update Automation", "GIT_COMMITTER_EMAIL": "java-update@localhost"})
     from .operations import CONTEXT, execute
-    if CONTEXT.get():
-        env["JAVA_UPDATE_RUN_ROOT"] = str(CONTEXT.get()["root"])
-        output = execute(command, Path(__file__).resolve().parents[1], env, 3600)
-        return subprocess.CompletedProcess(command, 0, output)
-    return subprocess.run(command, cwd=Path(__file__).resolve().parents[1],
-                          text=True, env=env, check=False)
+    context = CONTEXT.get()
+    if context is None:
+        raise PortfolioError("migration execution requires a retained run context")
+    env["JAVA_UPDATE_RUN_ROOT"] = str(context["root"])
+    output = execute(command, Path(__file__).resolve().parents[1], env, 3600)
+    return subprocess.CompletedProcess(command, 0, output)
 
 
 def migration_stage(selected: Sequence[Any], portfolio: Any, config: dict[str, Any], state: Path,
-                    execute: bool, managed: bool = False) -> list[dict[str, Any]]:
+                    execute: bool) -> list[dict[str, Any]]:
     outputs: list[dict[str, Any]] = []
     policy = _migration_policy(config)
     recipe_repository = config.get("migration", {}).get("openrewrite", {}).get("recipe_repository", "maven-central")
@@ -97,36 +116,20 @@ def migration_stage(selected: Sequence[Any], portfolio: Any, config: dict[str, A
         repo = by_key[key]
         plan_path = artifact_path(state, STAGES[2], "repositories", repo.key)
         result_path = artifact_path(state, STAGES[3], "repositories", repo.key)
-        if managed and result_path.exists():
+        if result_path.exists():
             existing = read_json(result_path)
             if existing["status"] == "migrated":
                 statuses[repo.key] = "complete"
                 outputs.append(existing)
                 continue
-        directory = result_path.parent
-        directory.mkdir(parents=True, exist_ok=True)
+        directory = result_path.parent / "attempts" / uuid.uuid4().hex[:8]
+        directory.mkdir(parents=True)
         policy_path = directory / "migration-policy.json"
         write_json(policy_path, policy)
         command = [sys.executable, str(Path(__file__).resolve().parents[1] / "migrate.py"), repo.source,
                    "--policy", str(policy_path), "--recipe-repository", recipe_repository,
-                   "--output", str(directory / "worktree"), "--workspace", str(directory / "engine")]
-        if managed:
-            import uuid
-            command.append("--commit")
-            directory = directory / "attempts" / uuid.uuid4().hex[:8]
-            directory.mkdir(parents=True)
-            policy_path = directory / "migration-policy.json"
-            write_json(policy_path, policy)
-            command[command.index("--policy") + 1] = str(policy_path)
-            command[command.index("--output") + 1] = str(directory / "worktree")
-            command[command.index("--workspace") + 1] = str(directory / "engine")
-        else:
-            command.append("--force")
-        if repo.ref:
-            # The legacy JSON manifest is the only path that carries refs.
-            manifest = directory / "repository.json"
-            write_json(manifest, [{"url": repo.source, "ref": repo.ref}])
-            command[2:3] = ["--manifest", str(manifest)]
+                   "--output", str(directory / "worktree"), "--workspace", str(directory / "engine"),
+                   "--commit"]
         result: dict[str, Any] = {
             "schema_version": 1, "artifact_type": "repository-migration-result",
             "stage": "04-migration", "generated_at": now(), "repository": repo.key,
@@ -145,19 +148,18 @@ def migration_stage(selected: Sequence[Any], portfolio: Any, config: dict[str, A
                                    "status": "complete" if completed.returncode == 0 else "failed"})
                 except (OSError, PortfolioError) as exc:
                     result.update({"status": "failed", "error": str(exc)})
-        if managed:
-            import java_migrator as engine
-            result["output"] = str(directory / "worktree" / engine.destination_name(repo.source))
-            if result["status"] == "complete":
-                try:
-                    summary = read_json(directory / "engine" / "reports" / "summary.json")
-                    engine_results = summary.get("results", [])
-                    if engine_results and all(item["status"] in {"changed", "unchanged"} for item in engine_results):
-                        result["status"] = "migrated"
-                    else:
-                        result["status"] = "analyzed"
-                except PortfolioError as exc:
-                    result.update({"status": "failed", "error": str(exc)})
+        import java_migrator as engine
+        result["output"] = str(directory / "worktree" / engine.destination_name(repo.source))
+        if result["status"] == "complete":
+            try:
+                summary = read_json(directory / "engine" / "reports" / "summary.json")
+                engine_results = summary.get("results", [])
+                if engine_results and all(item["status"] in {"changed", "unchanged"} for item in engine_results):
+                    result["status"] = "migrated"
+                else:
+                    result["status"] = "analyzed"
+            except PortfolioError as exc:
+                result.update({"status": "failed", "error": str(exc)})
         statuses[repo.key] = "complete" if result["status"] == "migrated" else result["status"]
         write_json(artifact_path(state, STAGES[3], "repositories", repo.key), result)
         outputs.append(result)
@@ -186,78 +188,6 @@ def migration_stage(selected: Sequence[Any], portfolio: Any, config: dict[str, A
     return outputs
 
 
-def legacy_main(argv: Sequence[str] | None = None) -> int:
-    try:
-        args = parser().parse_args(argv)
-        config = load_config(args.config.resolve())
-        portfolio = load_portfolio(args.portfolio.resolve())
-        errors = validate_targets(config)
-        if errors:
-            raise PortfolioError("invalid target configuration:\n- " + "\n- ".join(errors))
-        if args.command == "validate":
-            print(f"Valid: {len(portfolio.repositories)} repositories, "
-                  f"{len({item.application_id for item in portfolio.repositories})} applications, "
-                  f"{len({item.application_group_id for item in portfolio.repositories})} application groups")
-            return 0
-        selected = _selected(args, portfolio)
-        state = args.state.resolve()
-        if args.command == "report":
-            outputs = render_reports(state, selected)
-            print(f"Generated {len(outputs)} Markdown report(s) under {state / 'reports'}")
-            return 0
-        start = STAGES.index(args.from_stage)
-        end = STAGES.index(args.through)
-        if start > end:
-            raise PortfolioError("--from must not come after --through")
-        stages = STAGES[start:end + 1]
-        exit_code = 0
-        discoveries: list[dict[str, Any]] = []
-        if STAGES[0] in stages:
-            for repo in selected:
-                data = discover_repository(repo, config, state, args.refresh)
-                write_json(artifact_path(state, STAGES[0], "repositories", repo.key), data)
-                discoveries.append(data)
-                print(f"[{STAGES[0]}] {repo.key}: {data['status']}")
-            summarize_discoveries(selected, portfolio, discoveries, state)
-        else:
-            discoveries = [read_json(artifact_path(state, STAGES[0], "repositories", repo.key))
-                           for repo in selected]
-        if STAGES[1] in stages:
-            results = assess(selected, portfolio, discoveries, config, state)
-            print(f"[{STAGES[1]}] wrote {len(results)} assessment artifact(s)")
-        if STAGES[2] in stages:
-            results = plan(selected, portfolio, config, state)
-            print(f"[{STAGES[2]}] wrote {len(results)} plan artifact(s)")
-        if STAGES[3] in stages:
-            results = migration_stage(selected, portfolio, config, state, args.execute)
-            if args.execute and any(item["status"] in {"failed", "blocked"} for item in results):
-                exit_code = 1
-            if args.execute:
-                repository_results = [item for item in results if "repository" in item]
-                executed = sum(item["executed"] for item in repository_results)
-                failed = sum(item["status"] == "failed" for item in repository_results)
-                blocked = sum(item["status"] == "blocked" for item in repository_results)
-                print(f"[{STAGES[3]}] executed {executed} repository migration(s); "
-                      f"{failed} failed, {blocked} blocked")
-            else:
-                print(f"[{STAGES[3]}] planned {len(selected)} repository migration(s)")
-        reports = render_reports(state, selected)
-        run_record = {
-            "schema_version": 1, "generated_at": now(), "selected": [repo.key for repo in selected],
-            "stages": list(stages), "execute": args.execute, "reports": [str(path) for path in reports],
-            "exit_code": exit_code,
-        }
-        write_json(state / "runs" / f"{run_record['generated_at'].replace(':', '-')}.json", run_record)
-        return exit_code
-    except (PortfolioError, OSError, ValueError, json.JSONDecodeError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-
-
 def main(argv: Sequence[str] | None = None) -> int:
-    values = list(argv) if argv is not None else sys.argv[1:]
-    if "--legacy" in values:
-        values.remove("--legacy")
-        return legacy_main(values)
     from .workflow import main as workflow_main
-    return workflow_main(values)
+    return workflow_main(argv)

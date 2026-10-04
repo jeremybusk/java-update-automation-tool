@@ -346,7 +346,7 @@ def validate_stage(selected: Sequence[Repository], portfolio: Portfolio, config:
             receipt = read_json(root / "run.json")
             git(output, "merge-base", "--is-ancestor", receipt["sources"][repo.key]["commit"], "HEAD")
             changed_repo = dataclasses.replace(repo, source=str(output), ref=None)
-            discovery = discover_repository(changed_repo, config, root, False)
+            discovery = discover_repository(changed_repo, config)
             discovery["projects"] = [project for project in discovery["projects"] if not any(
                 Path(project.get("path", ".")).is_relative_to(Path(excluded)) for excluded in exclusions)]
             discovery["dependencies"] = dependencies

@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from java_update_tool.core import render_reports
+from java_update_tool.core import PortfolioError, render_reports
 from java_update_tool.runs import run_directory
 
 
@@ -19,8 +19,12 @@ def main() -> int:
     parser.add_argument("--run-id", default="latest")
     args = parser.parse_args()
     state = args.state.resolve()
-    root = run_directory(state, args.run_id) if (state / "latest.json").exists() else state
-    outputs = render_reports(root)
+    try:
+        root = run_directory(state, args.run_id)
+        outputs = render_reports(root)
+    except (PortfolioError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     print(f"Generated {len(outputs)} Markdown report(s) under {root / 'reports'}")
     return 0
 
