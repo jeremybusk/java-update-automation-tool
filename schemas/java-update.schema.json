@@ -100,13 +100,138 @@
               "type": "object",
               "additionalProperties": {
                 "type": "object",
-                "required": [
-                  "commands"
-                ],
                 "additionalProperties": false,
                 "properties": {
+                  "build": {
+                    "enum": [
+                      "test",
+                      "compile"
+                    ]
+                  },
                   "commands": {
                     "$ref": "#/$defs/commands"
+                  },
+                  "timeout": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "build_roots": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "exclusions": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string",
+                      "pattern": "\\S"
+                    }
+                  },
+                  "test_exemptions": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string",
+                      "pattern": "\\S"
+                    }
+                  },
+                  "suites": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "name",
+                        "command",
+                        "reports"
+                      ],
+                      "properties": {
+                        "name": {
+                          "type": "string",
+                          "minLength": 1,
+                          "pattern": "^[A-Za-z0-9_-]+$",
+                          "not": {
+                            "const": "unit"
+                          }
+                        },
+                        "command": {
+                          "type": "array",
+                          "minItems": 1,
+                          "items": {
+                            "type": "string",
+                            "minLength": 1
+                          }
+                        },
+                        "reports": {
+                          "type": "array",
+                          "minItems": 1,
+                          "items": {
+                            "type": "string",
+                            "minLength": 1
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "build_roots": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "exclusions": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "test_exemptions": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "suites": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "name",
+                  "command",
+                  "reports"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "^[A-Za-z0-9_-]+$",
+                    "not": {
+                      "const": "unit"
+                    }
+                  },
+                  "command": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "reports": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    }
                   }
                 }
               }
@@ -268,8 +393,102 @@
                   "url": {
                     "type": "string",
                     "minLength": 1
+                  },
+                  "request": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "enabled": {
+                        "type": "boolean"
+                      },
+                      "base": {
+                        "type": [
+                          "string",
+                          "null"
+                        ],
+                        "minLength": 1
+                      },
+                      "links": {
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "pattern": "^https://"
+                        }
+                      }
+                    }
                   }
                 }
+              }
+            },
+            "request": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "base": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "minLength": 1
+                },
+                "links": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "pattern": "^https://"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "source_selection": {
+          "enum": [
+            "default",
+            "current"
+          ]
+        },
+        "source_credentials": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          }
+        },
+        "diagnostics": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "check_bytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "run_bytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "retention_days": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "retention": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "days": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "pins": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
               }
             }
           }

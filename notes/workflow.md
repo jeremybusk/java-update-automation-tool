@@ -80,7 +80,7 @@ Stage 05 operates on migrated, committed source. It runs every discovered build 
 ```yaml
 workflow:
   validation:
-    build: test                    # compile opts out of the test task explicitly
+    build: test                    # compile needs a reasoned unit exemption
     timeout: 3600                  # Per-command timeout
     commands:
       - ["./scripts/contract-tests.sh"]
@@ -90,7 +90,7 @@ workflow:
         commands: [["./scripts/api-contract.sh"]]
 ```
 
-Commands are argv lists, run from the migrated repository root; repository checks append to global checks. Configure required contract/integration checks explicitly. Commands that edit source fail validation. Command diagnostics retained here are sanitized outcomes; engine logs remain available under the migration attempt.
+Commands are argv lists, run from the migrated repository root; repository checks append to global checks. Configure required contract/integration suites and fresh report globs explicitly. Commands that edit source fail validation. Bounded redacted diagnostics are retained under the run, with locations in stage resources and summaries.
 
 Maven validation runs `test`/`compile`, `help:effective-pom`, and resolved `dependency:tree` inventories, including reactor modules. Gradle runs `test`/`classes` and an init-script task that resolves build configurations, including BOM/catalog dependencies. Effective Java compiler levels/toolchains and resolved Boot versions govern compliance. A dependency inventory that cannot be resolved blocks publication.
 
@@ -125,7 +125,7 @@ For hosted source default-branch changes, explicitly set `source_default_branch:
 
 Auto-creation requires an owner and prefix (or an explicit per-repository name); a name collision stops. A failed push after creation retains that creation receipt, allowing retry without treating the same run's destination as a collision. To reuse an existing repository, select `precreated` with owner/name, or a per-repository Git `url`. Populated repositories must pass ancestry checks. Use owner/name for hosted destinations when their default-branch setting must be changed through the API; a plain Git URL publishes the configured ref but does not alter host settings.
 
-GitHub uses `GH_TOKEN`, falling back to `gh auth token`; GitLab uses `GITLAB_TOKEN`. Override the environment variable name with `token_env`. Tokens authenticate provider APIs and hosted HTTPS publication; SSH and existing Git credential helpers remain supported. Source discovery/history fetching uses normal Git credentials. Self-hosted GitLab can set `api_url: https://git.example.com/api/v4` and `namespace_id`. Tokens never belong in YAML or repository URLs. Saved URLs containing embedded credentials/query strings are rejected.
+GitHub uses `GH_TOKEN`, falling back to `gh auth token`; GitLab uses `GITLAB_TOKEN`. Override the environment variable name with `token_env`. Tokens authenticate provider APIs and hosted HTTPS publication; SSH and existing Git credential helpers remain supported. Source discovery/history fetching uses separately configured host credentials or normal Git credential helpers. Self-hosted GitLab can set `api_url: https://git.example.com/api/v4` and `namespace_id`. Tokens never belong in YAML or repository URLs. Saved URLs containing embedded credentials/query strings are rejected.
 
 Publishing receipts are independent per target. After partial success, return code 1, retain the validated commit and successful receipts, and resume publishing to retry only unfinished targets:
 
@@ -150,4 +150,158 @@ python3 -B -m unittest discover -s tests -v
 JAVA_UPDATE_INTEGRATION=1 python3 -B -m unittest discover -s tests -p test_integration.py -v
 ```
 
-Normal tests use actual temporary Git histories and fake migration/build/provider boundaries, without external publication. Integration tests run real transformations, builds, effective inventories, and local publication. They skip without explicit opt-in or required tools. Use `portfolio.py --legacy` for previous four-stage invocations/state; legacy JSON is not imported as approved six-stage evidence.
+Normal tests use actual temporary Git histories and fake migration/build/provider boundaries, without external publication. Integration tests run real transformations, builds, effective inventories, and local publication. They skip without explicit opt-in; once enabled, missing tools or credentials fail. Use `portfolio.py --legacy` for previous four-stage invocations/state; legacy JSON is not imported as approved six-stage evidence.
+# Hardened validation and retained-run operations
+
+Omitted Git refs select the source default branch consistently. Local repositories
+use `origin/HEAD` when available; without it, a checked-out `main`/`master`, then
+the available conventional default, then the sole/current local branch resolves
+the default. Configure an explicit ref when a repository has a different intended
+default. `workflow.source_selection: current` or `--source-selection current`
+explicitly selects a local checkout. Dirty local input remains an error.
+
+Snapshots persist independently per repository. An interrupted clone is rebuilt;
+a successfully promoted snapshot is reconciled and verified before resumption.
+Rejected resume/approval invocations appear in `events.jsonl` without changing a
+previously completed outcome. Invocation errors return 2, stage failures return 1,
+and manual review pauses return 3.
+
+Before review, a run captures the history-transfer manifest and request base SHA.
+Publishing obtains full ancestry for those captured objects. A changed manifest
+requires a new run. Source migration branches contain the run ID and remain stable
+across retries; older branch templates receive a run suffix automatically.
+Target receipts bind the validated SHA, tree, destination, and history plan.
+Retries reconcile actual refs. Human edits, divergent refs, and tag conflicts
+stop an update; successful targets remain independently recorded.
+
+Validation discovers independent nested builds and checks all of them by default.
+Only declared Maven modules/Gradle projects establish parent membership.
+Composite Gradle builds remain independent checks. Dynamic membership that cannot
+be established statically is treated conservatively as an independent build.
+Use `validation.build_roots` to select a narrower scope and `validation.exclusions`
+to give a reason for every excluded root. Paths are relative to the migrated repo;
+the root is `.`. Reports disclose selected scope and exclusions.
+
+```yaml
+workflow:
+  validation:
+    build_roots: ["."]
+    exclusions:
+      tools/old-service: "Separate application handled in a later migration"
+    test_exemptions: {} # e.g. {unit: "A generated BOM with no executable code"}
+    suites:
+      - name: contract
+        command: ["./scripts/run-contract-tests"]
+        reports: ["build/contract-results/TEST-*.xml"]
+```
+
+Fresh executed unit tests are required for publication. Validation deletes prior
+generated XML reports, disables Gradle build-cache/test-task reuse, and records
+counts and report hashes. Missing, empty, entirely skipped, or failing suites do
+not qualify. Compile-only checks require a reasoned unit exemption to publish a
+legitimately testless project. Declared Maven Failsafe checks run through `verify`;
+declared Gradle integration/contract tasks and configured suites also need fresh
+reports. Use configured suites for nonstandard task/report conventions. Report
+exemptions and exclusions are part of the validation policy and approvals.
+
+Maven compliance follows the effective compiler release/target configuration and
+executions. Informational `java.version` values are recorded separately. Resolved
+dependencies, framework versions, dependency evidence, and cohort gates remain
+required. Older evidence without the new evidence version must be refreshed.
+
+Optional draft reviews are disabled by default:
+
+```yaml
+workflow:
+  publishing:
+    enabled: true
+    targets: [local_repo, src_repo]
+    request:
+      enabled: true
+      base: null # capture source default; alternatively a specific source branch
+      links: []  # optional HTTPS links to hosted CI/artifact evidence
+  source_credentials:
+    github.com: GH_TOKEN
+    gitlab.example.org: SOURCE_GITLAB_TOKEN
+```
+
+Draft GitHub PRs and GitLab MRs are created after source-branch publishing. Their
+receipts are separate: retrying an API failure reconciles the existing matching
+request and skips an unchanged successful push. The base tip must still match the
+captured commit before creation. Requests summarize the validated commit, target,
+checks, test counts, exclusions, exemptions, and run identity. Human title/body
+edits and readiness are preserved. Closed/merged or mismatching requests require
+explicit operator resolution; automation never reopens, downgrades, or replaces
+them. API permissions remain the hosting provider's normal requirements.
+
+Source credentials are selected by intended host independently from destination
+credentials. Provider tokens are used only on matching Git/API hosts; unmatched
+remotes use their normal credential helpers. Persist environment-variable names
+in YAML, with token values supplied only through the environment.
+
+`portfolio.py export-evidence RUN_ID --output /path/evidence.tar.gz` creates a
+redacted inspection bundle with SHA-256 file manifest. Hosted links are optional.
+The bundle includes outcomes, inventories, approvals/receipts, reports, and retained
+diagnostics; it does not provide portable resumption of host-specific checkouts.
+
+Every run has `events.jsonl`, `tool-versions.json`, and `diagnostics/`. Commands
+record bounded redacted output, duration, status, and diagnostic locations. Defaults
+are 10 MiB/check, 100 MiB/run, and 30 days for diagnostic logs, configurable through
+`workflow.diagnostics`. Truncation is explicit. Log expiry leaves durable
+inventories, approvals, outcomes, and publication receipts intact.
+
+Local locks reject concurrent mutation of the same run or destination immediately
+with owner information. Independent runs can run concurrently. Use one host per
+state directory, isolated CI job state, CI target concurrency controls, and Git
+remote-ref guards for other writers. The event journal is an operational trace.
+
+`portfolio.py prune` is a dry run. `portfolio.py prune --apply` applies eligible
+run deletion. Defaults protect the latest run; active, pending, failed/retryable
+runs; referenced evidence/output; and durable local publishing repositories.
+`workflow.retention.days` defaults to 30. Add run IDs or evidence paths to
+`workflow.retention.pins` for references outside the state directory. Only
+diagnostic expiration is automatic. Deletion decisions are retained in the state
+journal. Old attempt policies required for retained checkpoint identities remain
+protected with their run.
+
+## Required CI matrix
+
+The `Migration checks` workflow runs fast regressions for every PR. Changes to
+migration, validation, shared workflow/discovery/policy code, tests, or CI require
+real builds. Releases and manual checks run the entire matrix. Require the
+`migration-gate` check in branch protection and publish releases only after its
+successful tag/manual run. Repository protection settings are managed separately
+from these checked-in workflows.
+
+| Case | Input → target | Tool/layout |
+| --- | --- | --- |
+| maven17, gradle17 | Java 17 → 21 | Single project |
+| maven8, gradle8 | Java 8 → 25 | Single project |
+| maven-bom | Java 17 → 21 | Versionless JUnit dependency via BOM |
+| maven-multi, gradle-multi | Java 17 → 21 | Maven reactor / Gradle multi-project |
+| gradle-catalog | Java 17 → 21 | Dependency version catalog |
+| boot35-maven, boot35-gradle | Boot 3.4.2 → 3.5.x; Java 17 → 21 | Framework recipes |
+| boot4-maven, boot4-gradle | Boot 3.5.1 → 4.0.x; Java 17 → 21 | Framework recipes |
+
+CI uses Maven 3.9.11, Gradle 8.14.3 with JDK 21 for Java-21/Boot cases, and Gradle
+9.1.0 with JDK 25 for Java-25 cases. Recipe versions are pinned in the migration
+defaults; Boot uses `rewrite-spring:6.40.0`. Each run records actual tool versions.
+These fixtures establish this matrix, rather than universal tool/version support.
+
+Spring Boot cases require repository secrets `CODE_GENOME_USERNAME` and
+`CODE_GENOME_TOKEN` on trusted jobs. Fork PRs run credential-free checks; maintainers
+validate a reviewed identical commit on a trusted repository branch before merging.
+The gate fails when required trusted checks are skipped or prerequisites are absent.
+The workflow never uses `pull_request_target` to run fork content with secrets.
+
+Run a selected native case locally with JDK and build tools available:
+
+```sh
+JAVA_UPDATE_INTEGRATION=1 JAVA_UPDATE_CASE=maven8 \
+  JAVA_UPDATE_ARTIFACTS=/tmp/java-update-evidence \
+  python3 -m unittest discover -s tests -p test_integration.py -v
+```
+
+An enabled native check fails for missing prerequisites rather than reporting
+successful coverage. Without `JAVA_UPDATE_INTEGRATION=1`, the normal regression
+suite skips its explicit native-test boundary.

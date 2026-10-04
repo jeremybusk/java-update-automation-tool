@@ -12,10 +12,12 @@ import shutil
 import subprocess
 import tempfile
 import uuid
+import urllib.parse
 from pathlib import Path
 from typing import Any, Sequence
 
 from .core import Portfolio, PortfolioError, Repository, STAGES, now, read_json, write_json
+from .operations import execute, event, lock
 
 IGNORED = {".git", "target", "build", ".gradle", "__pycache__", ".java-update", ".migration-work"}
 GIT_CREDENTIALS = contextvars.ContextVar("git_credentials", default=None)
@@ -43,14 +45,9 @@ def command(argv: Sequence[str], cwd: Path, timeout: int = 300) -> str:
                 askpass.write_text("#!/usr/bin/env python3\nimport os, sys\nprint('oauth2' if 'username' in sys.argv[1].lower() else os.environ['JAVA_UPDATE_GIT_TOKEN'])\n")
                 askpass.chmod(0o700)
                 env.update({"GIT_ASKPASS": str(askpass), "JAVA_UPDATE_GIT_TOKEN": credentials[0]})
-            result = subprocess.run(list(argv), cwd=cwd, env=env, text=True, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, timeout=timeout, check=False)
+            return execute(list(argv), cwd, env, timeout, require_complete=argv[0] == "git")
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise PortfolioError(f"command could not finish: {argv[0]}") from exc
-    if result.returncode:
-        # Git errors can contain credential URLs; do not persist raw stderr.
-        raise PortfolioError(f"{argv[0]} command failed with exit code {result.returncode}")
-    return result.stdout.strip()
 
 
 def git(path: Path, *argv: str) -> str:
@@ -76,11 +73,60 @@ def files_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
+def default_branch(repo: Repository) -> str:
+    source = Path(repo.source)
+    if source.is_dir():
+        try:
+            return git(source, "symbolic-ref", "--short", "refs/remotes/origin/HEAD").removeprefix("origin/")
+        except PortfolioError:
+            branches = git(source, "for-each-ref", "--format=%(refname:short)", "refs/heads/").splitlines()
+            try:
+                current = git(source, "symbolic-ref", "--short", "HEAD")
+            except PortfolioError:
+                current = ""
+            if current in {"main", "master"} and current in branches:
+                return current
+            for branch in ("main", "master"):
+                if branch in branches:
+                    return branch
+            branch = git(source, "symbolic-ref", "--short", "HEAD")
+            if branch in branches:
+                return branch
+            raise PortfolioError(f"cannot determine local default branch: {repo.key}")
+    lines = command(["git", "ls-remote", "--symref", repo.source, "HEAD"], Path.cwd()).splitlines()
+    branch = next((line.split()[1].removeprefix("refs/heads/") for line in lines if line.startswith("ref:")), "")
+    if not branch:
+        raise PortfolioError(f"cannot determine default branch for {repo.key}")
+    return branch
+
+
+@contextlib.contextmanager
+def source_auth(url: str, workflow: dict[str, Any]):
+    host = urllib.parse.urlparse(url).hostname
+    name = workflow.get("source_credentials", {}).get(host)
+    if not name:
+        name = {"github.com": "GH_TOKEN", "gitlab.com": "GITLAB_TOKEN"}.get(host)
+    with git_credentials(os.environ.get(name, "") if name else "", url):
+        yield
+
+
+def ref_manifest(repo: Repository, scope: str, branch: str) -> dict[str, str]:
+    source = Path(repo.source)
+    if source.is_dir():
+        text = git(source, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/", "refs/tags/")
+    else:
+        text = command(["git", "ls-remote", "--heads", "--tags", repo.source], Path.cwd())
+    values = {ref: sha for sha, ref in (line.split() for line in text.splitlines()) if not ref.endswith("^{}")}
+    if scope == "default":
+        values = {ref: sha for ref, sha in values.items() if ref == "refs/heads/" + branch}
+    return values
+
+
 def source_commit(repo: Repository) -> str:
     source = Path(repo.source)
+    revision = repo.ref or default_branch(repo)
     if source.is_dir() and ((source / ".git").exists() or (source / "HEAD").is_file()):
-        return git(source, "rev-parse", "--verify", f"{repo.ref or 'HEAD'}^{{commit}}")
-    revision = repo.ref or "HEAD"
+        return git(source, "rev-parse", "--verify", f"{revision}^{{commit}}")
     if len(revision) == 40 and all(char in "0123456789abcdefABCDEF" for char in revision):
         return revision.lower()
     lines = command(["git", "ls-remote", repo.source, revision, f"refs/heads/{revision}",
@@ -108,6 +154,11 @@ def run_directory(state: Path, run_id: str | None = None) -> Path:
 
 
 def create_run(state: Path, selected: Sequence[Repository], config: dict[str, Any], workflow: dict[str, Any]) -> Path:
+    with lock(state / ".locks", "run-catalog:" + str(state.resolve()), "create run"):
+        return _create_run(state, selected, config, workflow)
+
+
+def _create_run(state: Path, selected: Sequence[Repository], config: dict[str, Any], workflow: dict[str, Any]) -> Path:
     run_id = now().replace(":", "-").replace("+", "-") + "-" + uuid.uuid4().hex[:8]
     root = state / "runs" / run_id
     root.mkdir(parents=True)
@@ -122,60 +173,74 @@ def create_run(state: Path, selected: Sequence[Repository], config: dict[str, An
 
 
 def snapshot(repo: Repository, root: Path) -> tuple[Repository, dict[str, Any]]:
+    workflow = read_json(root / "run.json")["workflow"]
     target = root / "sources" / repo.key
     source = Path(repo.source)
     remote = not source.is_dir()
     local_git = (source / ".git").exists() or ((source / "HEAD").is_file() and (source / "objects").is_dir())
-    if remote:
-        refs = command(["git", "ls-remote", "--symref", repo.source, "HEAD"], root)
-        default_branch = next((line.split()[1].removeprefix("refs/heads/") for line in refs.splitlines()
-                               if line.startswith("ref:")), "")
-        if not default_branch:
-            raise PortfolioError(f"cannot determine default branch for {repo.key}")
-        args = ["git", "clone", "--depth", "1", "--no-tags", "--branch", default_branch,
-                "--", repo.source, str(target)]
-        command(args, root)
-        if repo.ref:
-            git(target, "fetch", "--depth", "1", "origin", repo.ref)
-            git(target, "checkout", "--detach", "FETCH_HEAD")
-    elif local_git:
-        bare = git(source, "rev-parse", "--is-bare-repository") == "true"
-        if not bare and git(source, "status", "--porcelain"):
-            raise PortfolioError(f"local source must be clean before snapshotting: {repo.key}")
-        try:
-            default_branch = git(source, "symbolic-ref", "--short", "refs/remotes/origin/HEAD").removeprefix("origin/")
-        except PortfolioError:
+    identity = {"source": repo.source, "ref": repo.ref, "selection": workflow["source_selection"]}
+    if target.exists():
+        metadata = target / ".git/java-update-snapshot.json"
+        info = read_json(metadata)
+        if info.get("identity") != identity or files_digest(target) != info["tree_hash"] or git(target, "rev-parse", "HEAD") != info["commit"]:
+            raise PortfolioError(f"incomplete or changed source snapshot: {repo.key}; start a new run")
+        return dataclasses.replace(repo, source=str(target), ref=None), info
+    temporary = target.parent / ("." + repo.key + ".incomplete")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if temporary.is_symlink():
+        raise PortfolioError("unsafe snapshot staging path")
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    with source_auth(repo.source, workflow):
+        if remote or local_git:
+            if local_git and git(source, "rev-parse", "--is-bare-repository") != "true" and git(source, "status", "--porcelain"):
+                raise PortfolioError(f"local source must be clean before snapshotting: {repo.key}")
+            branch = default_branch(repo)
+            selection = repo.ref or ("HEAD" if not remote and workflow["source_selection"] == "current" else branch)
+            selected_commit = source_commit(dataclasses.replace(repo, ref=selection))
+            manifest = ref_manifest(repo, workflow["publishing"]["history"], branch)
+            base = {**workflow["publishing"]["request"], **workflow["publishing"]["repositories"].get(repo.key, {}).get("request", {})}.get("base") or branch
+            base_commit = source_commit(dataclasses.replace(repo, ref=base))
+            args = ["git", "clone", "--no-tags", "--branch", branch]
+            args += ["--depth", "1"] if remote else ["--no-hardlinks"]
+            command([*args, "--", repo.source, str(temporary)], root)
+            if remote and selection != branch:
+                git(temporary, "fetch", "--depth", "1", "origin", selection)
+            if not remote and selection == "HEAD":
+                git(temporary, "fetch", "--no-tags", repo.source, selected_commit)
             try:
-                default_branch = git(source, "symbolic-ref", "--short", "HEAD")
+                git(temporary, "checkout", "--detach", selected_commit)
             except PortfolioError:
-                branches = git(source, "for-each-ref", "--format=%(refname:short)", "refs/heads/").splitlines()
-                default_branch = next((name for name in ("main", "master") if name in branches), "")
-                if not default_branch:
-                    raise PortfolioError(f"cannot determine default branch for detached local source: {repo.key}")
-        command(["git", "clone", "--no-hardlinks", "--", repo.source, str(target)], root)
-    else:
-        if repo.ref:
-            raise PortfolioError(f"cannot select a Git ref on a non-Git source: {repo.key}")
-        default_branch = "main"
-        shutil.copytree(source, target, symlinks=True, ignore=shutil.ignore_patterns(*IGNORED))
-        files_digest(target)
-        git(target, "init", "-b", default_branch)
-        git(target, "add", "--all")
-        git(target, "commit", "--allow-empty", "-m", "Snapshot local migration input")
-    if repo.ref and not remote:
-        # Local clone branches other than HEAD live under origin/.
-        try:
-            revision = git(target, "rev-parse", "--verify", f"{repo.ref}^{{commit}}")
-        except PortfolioError:
-            revision = git(target, "rev-parse", "--verify", f"origin/{repo.ref}^{{commit}}")
-        git(target, "checkout", "--detach", revision)
-    sha = git(target, "rev-parse", "HEAD")
-    default_commit = git(target, "rev-parse", f"origin/{default_branch}") if remote or local_git else sha
-    return dataclasses.replace(repo, source=str(target), ref=None), {
-        "source": repo.source, "ref": repo.ref, "commit": sha, "default_branch": default_branch,
-        "snapshot": str(target), "tree_hash": files_digest(target), "has_remote": remote or local_git,
-        "default_commit": default_commit,
-    }
+                git(temporary, "fetch", "--depth", "1", "origin", selected_commit)
+                git(temporary, "checkout", "--detach", selected_commit)
+            default_commit = manifest.get("refs/heads/" + branch)
+            if not default_commit:
+                raise PortfolioError("source default branch missing from captured manifest")
+        else:
+            if repo.ref or workflow["source_selection"] == "current":
+                raise PortfolioError(f"cannot select a Git ref on a non-Git source: {repo.key}")
+            branch, base = "main", "main"
+            shutil.copytree(source, temporary, symlinks=True, ignore=shutil.ignore_patterns(*IGNORED))
+            files_digest(temporary)
+            git(temporary, "init", "-b", branch)
+            git(temporary, "add", "--all")
+            git(temporary, "commit", "--allow-empty", "-m", "Snapshot local migration input")
+            selected_commit = default_commit = base_commit = git(temporary, "rev-parse", "HEAD")
+            manifest = {"refs/heads/main": selected_commit}
+    info = {"identity": identity, "source": repo.source, "ref": repo.ref, "commit": selected_commit,
+            "default_branch": branch, "snapshot": str(target), "tree_hash": files_digest(temporary),
+            "has_remote": remote or local_git, "default_commit": default_commit,
+            "ref_manifest": manifest, "request_base": base, "request_base_commit": base_commit,
+            "migration_branch": workflow["publishing"]["repositories"].get(repo.key, {}).get("source_branch", workflow["publishing"]["source_branch"]).format(
+                java=read_json(root / "run.json")["config"]["targets"]["java"]["desired"], run_id=root.name)}
+    # Older configured templates still get a unique per-run suffix.
+    if root.name not in info["migration_branch"]:
+        info["migration_branch"] += "-" + root.name
+    git(temporary, "check-ref-format", "--branch", info["migration_branch"])
+    write_json(temporary / ".git/java-update-snapshot.json", info)
+    temporary.rename(target)
+    event("snapshot-completed", repository=repo.key, commit=selected_commit, manifest=manifest)
+    return dataclasses.replace(repo, source=str(target), ref=None), info
 
 
 def snapshots(root: Path, portfolio: Portfolio, selected: Sequence[Repository]) -> tuple[Portfolio, list[Repository]]:
@@ -186,14 +251,16 @@ def snapshots(root: Path, portfolio: Portfolio, selected: Sequence[Repository]) 
         if repo.key not in sources:
             migrated, sources[repo.key] = snapshot(repo, root)
             replaced[repo.key] = migrated
+            receipt["sources"] = sources
+            write_json(root / "run.json", receipt)
         else:
             info = sources[repo.key]
             path = Path(info["snapshot"])
+            if not info.get("ref_manifest"):
+                raise PortfolioError("saved source lacks immutable refs; start a new run")
             if files_digest(path) != info["tree_hash"] or git(path, "rev-parse", "HEAD") != info["commit"]:
                 raise PortfolioError(f"source snapshot changed: {repo.key}; start a new run")
             replaced[repo.key] = dataclasses.replace(repo, source=info["snapshot"], ref=None)
-    receipt["sources"] = sources
-    write_json(root / "run.json", receipt)
     return dataclasses.replace(portfolio, repositories=tuple(replaced.get(repo.key, repo) for repo in portfolio.repositories)), [replaced[repo.key] for repo in selected]
 
 
@@ -208,6 +275,10 @@ def checkpoint_hash(root: Path, stage: str) -> str:
             parts = path.relative_to(root / name).parts
             if "attempts" not in parts and "history" not in parts:
                 values[str(path.relative_to(root))] = read_json(path)
+        if name == STAGES[4]:
+            for path in sorted((root / name).rglob("*")):
+                if path.is_file() and path.suffix in {".xml", ".tgf"} and "history" not in path.relative_to(root / name).parts:
+                    values[str(path.relative_to(root))] = hashlib.sha256(path.read_bytes()).hexdigest()
         if name == STAGES[3]:
             for path in sorted((root / name).glob("repositories/*/attempts/*/migration-policy.json")):
                 values[str(path.relative_to(root))] = read_json(path)
@@ -229,6 +300,7 @@ def approve(root: Path, stage: str) -> None:
     receipt["approvals"][stage] = {"approved_at": now(), "fingerprint": checkpoint_hash(root, stage)}
     receipt["status"] = "approved"
     write_json(root / "run.json", receipt)
+    event("approval", root, stage=stage, fingerprint=receipt["approvals"][stage]["fingerprint"])
 
 
 def check_approvals(root: Path) -> None:
@@ -242,6 +314,7 @@ def check_approvals(root: Path) -> None:
                     receipt["stages"].pop(later, None)
             receipt["status"] = "invalidated"
             write_json(root / "run.json", receipt)
+            event("approval-invalidated", root, stage=stage)
             raise PortfolioError(f"{stage} artifacts changed; approval invalidated, review and revalidate before proceeding")
 
 

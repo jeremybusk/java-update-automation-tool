@@ -11,14 +11,19 @@ from .core import PortfolioError, STAGES
 
 DEFAULTS = {
     "mode": "manual", "checkpoints": list(STAGES), "show_diffs": False,
+    "source_selection": "default", "source_credentials": {},
+    "diagnostics": {"check_bytes": 10485760, "run_bytes": 104857600, "retention_days": 30},
+    "retention": {"days": 30, "pins": []},
     "include_dependencies": False, "allow_dependency_override": False,
     "dependency_evidence": {}, "allow_downgrades": False,
-    "validation": {"build": "test", "commands": [], "timeout": 3600, "repositories": {}},
+    "validation": {"build": "test", "commands": [], "timeout": 3600, "repositories": {},
+                   "build_roots": [], "exclusions": {}, "test_exemptions": {}, "suites": []},
     "publishing": {
         "enabled": False, "targets": ["local_repo"], "history": "default",
         "independent_applications": False, "provider": "github",
         "mode": "autocreate", "prefix": "", "owner": "", "namespace_id": None,
-        "default_branch": "main", "source_branch": "automation/java-{java}",
+        "default_branch": "main", "source_branch": "automation/java-{java}-{run_id}",
+        "request": {"enabled": False, "base": None, "links": []},
         "source_default_branch": None,
         "private": True, "api_url": None, "token_env": None, "repositories": {},
     },
@@ -31,6 +36,32 @@ def validate_commands(commands: Any) -> None:
         for command in commands
     ):
         raise PortfolioError("workflow.validation.commands must contain non-empty argv lists")
+
+
+def validate_validation(options: dict[str, Any]) -> None:
+    if options["build"] not in {"compile", "test"} or type(options["timeout"]) is not int or options["timeout"] < 1:
+        raise PortfolioError("validation requires build=compile/test and positive timeout")
+    if not isinstance(options["build_roots"], list) or any(not isinstance(path, str) or invalid_relative_path(path) for path in options["build_roots"]):
+        raise PortfolioError("validation.build_roots must contain relative build directories")
+    for key in ("exclusions", "test_exemptions"):
+        values = options[key]
+        if not isinstance(values, dict) or any(not isinstance(name, str) or not isinstance(reason, str) or not reason.strip() for name, reason in values.items()):
+            raise PortfolioError(f"validation.{key} requires names and non-empty reasons")
+    if not isinstance(options["suites"], list):
+        raise PortfolioError("validation.suites must be a list")
+    for suite in options["suites"]:
+        if not isinstance(suite, dict) or set(suite) != {"name", "command", "reports"} or not isinstance(suite["name"], str) or not re.fullmatch(r"[A-Za-z0-9_-]+", suite["name"]) or suite["name"] == "unit":
+            raise PortfolioError("custom suites require a unique name, command, and reports")
+        validate_commands([suite["command"]])
+        if not isinstance(suite["reports"], list) or not suite["reports"] or any(not isinstance(path, str) or invalid_relative_path(path) for path in suite["reports"]):
+            raise PortfolioError("suite reports must be relative report globs")
+    if len({suite["name"] for suite in options["suites"]}) != len(options["suites"]):
+        raise PortfolioError("duplicate validation suite name")
+
+
+def invalid_relative_path(path: str) -> bool:
+    from pathlib import PurePath
+    return not path or PurePath(path).is_absolute() or ".." in PurePath(path).parts
 
 
 def validate_publishing(options: dict[str, Any]) -> None:
@@ -56,6 +87,15 @@ def validate_publishing(options: dict[str, Any]) -> None:
         raise PortfolioError("publishing.token_env must be an environment variable name")
     if options["namespace_id"] is not None and (type(options["namespace_id"]) is not int or options["namespace_id"] < 1):
         raise PortfolioError("publishing.namespace_id must be a positive integer or null")
+    request = options["request"]
+    if not isinstance(request, dict) or set(request) != {"enabled", "base", "links"} or type(request["enabled"]) is not bool:
+        raise PortfolioError("publishing.request requires enabled, base, and links")
+    if request["base"] is not None and (not isinstance(request["base"], str) or not request["base"]):
+        raise PortfolioError("publishing.request.base must be a branch name or null")
+    if not isinstance(request["links"], list) or any(not isinstance(link, str) or not link.startswith("https://") for link in request["links"]):
+        raise PortfolioError("publishing.request.links must contain HTTPS URLs")
+    for link in request["links"]:
+        validate_location(link)
 
 
 def validate_location(value: str) -> None:
@@ -75,7 +115,7 @@ def merge(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
     for key, value in updates.items():
         if key not in base:
             raise PortfolioError(f"unknown workflow option: {key}")
-        if isinstance(base[key], dict) and key not in {"repositories", "dependency_evidence"}:
+        if isinstance(base[key], dict) and key not in {"repositories", "dependency_evidence", "source_credentials", "exclusions", "test_exemptions"}:
             if not isinstance(value, dict):
                 raise PortfolioError(f"workflow.{key} must be a mapping")
             result[key] = merge(base[key], value)
@@ -93,6 +133,15 @@ def workflow_policy(config: dict[str, Any], overrides: dict[str, Any] | None = N
         result = merge(result, overrides)
     if result["mode"] not in {"manual", "unattended"}:
         raise PortfolioError("workflow.mode must be manual or unattended")
+    if result["source_selection"] not in {"default", "current"}:
+        raise PortfolioError("workflow.source_selection must be default or current")
+    if not isinstance(result["source_credentials"], dict) or any(not isinstance(host, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(name)) for host, name in result["source_credentials"].items()):
+        raise PortfolioError("source_credentials must map intended hosts to token environment names")
+    for key, value in result["diagnostics"].items():
+        if type(value) is not int or value < 1:
+            raise PortfolioError(f"diagnostics.{key} must be a positive integer")
+    if type(result["retention"]["days"]) is not int or result["retention"]["days"] < 1 or not isinstance(result["retention"]["pins"], list) or any(not isinstance(pin, str) or not pin for pin in result["retention"]["pins"]):
+        raise PortfolioError("retention requires positive days and a list of run/evidence pins")
     for key in ("show_diffs", "include_dependencies", "allow_dependency_override", "allow_downgrades"):
         if not isinstance(result[key], bool):
             raise PortfolioError(f"workflow.{key} must be boolean")
@@ -111,12 +160,14 @@ def workflow_policy(config: dict[str, Any], overrides: dict[str, Any] | None = N
     if type(validation["timeout"]) is not int or validation["timeout"] < 1:
         raise PortfolioError("workflow.validation.timeout must be positive")
     validate_commands(validation["commands"])
+    validate_validation(validation)
     if not isinstance(validation["repositories"], dict):
         raise PortfolioError("workflow.validation.repositories must be a repository-key mapping")
     for value in validation["repositories"].values():
-        if not isinstance(value, dict) or set(value) != {"commands"}:
-            raise PortfolioError("repository validation options must contain commands")
-        validate_commands(value["commands"])
+        if not isinstance(value, dict) or set(value) - (set(validation) - {"repositories"}):
+            raise PortfolioError("unknown repository validation option")
+        validate_validation({**validation, **value})
+        validate_commands(value.get("commands", []))
     publishing = result["publishing"]
     validate_publishing(publishing)
     if not isinstance(publishing["targets"], list) or not publishing["targets"] or any(
@@ -130,7 +181,7 @@ def workflow_policy(config: dict[str, Any], overrides: dict[str, Any] | None = N
     for value in publishing["repositories"].values():
         if not isinstance(value, dict) or set(value) - allowed:
             raise PortfolioError("unknown repository publishing option")
-        validate_publishing({**publishing, **value})
+        validate_publishing({**publishing, **value, "request": {**publishing["request"], **value.get("request", {})}})
     pins = config.get("alignment", {}).get("dependencies", {}).get("pins", {})
     if not isinstance(pins, dict) or any(not isinstance(key, str) or ":" not in key or not isinstance(value, (str, int)) or isinstance(value, bool) or not str(value) for key, value in pins.items()):
         raise PortfolioError("alignment.dependencies.pins must map group:artifact patterns to exact versions")

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import uuid
 import xml.etree.ElementTree as ET
@@ -12,6 +13,7 @@ import java_migrator as engine
 from .core import Repository, Portfolio, PortfolioError, STAGES, artifact_path, assess, discover_repository, now, read_json, version_matches, write_json
 from .policy import resolve_pin, compatibility_hash
 from .runs import command, files_digest, git, IGNORED
+from .operations import event
 
 
 def child(node: ET.Element, name: str) -> ET.Element | None:
@@ -29,22 +31,36 @@ def maven_inventory(path: Path) -> dict[str, Any]:
     except (OSError, ET.ParseError) as exc:
         raise PortfolioError("effective Maven model was not produced or is invalid") from exc
     projects = [root] if root.tag.rsplit("}", 1)[-1] == "project" else [item for item in root if item.tag.rsplit("}", 1)[-1] == "project"]
-    java, boot, dependencies = set(), set(), []
+    java, boot, dependencies, metadata = set(), set(), [], []
     for project in projects:
         props = child(project, "properties")
-        for key in ("maven.compiler.release", "java.version", "maven.compiler.target", "maven.compiler.source"):
-            value = content(props, key)
-            if value:
-                java.add(value.removeprefix("1."))
-                break
+        metadata.append({"project": content(project, "artifactId"), "java.version": content(props, "java.version")})
         build = child(project, "build")
         plugins = child(build, "plugins") if build is not None else None
-        for plugin in list(plugins) if plugins is not None else []:
-            if content(plugin, "artifactId") == "maven-compiler-plugin":
-                config = child(plugin, "configuration")
-                value = content(config, "release") or content(config, "target") or content(config, "source")
-                if value:
-                    java.add(value.removeprefix("1."))
+        compiler = next((plugin for plugin in list(plugins) if content(plugin, "artifactId") == "maven-compiler-plugin"), None) if plugins is not None else None
+        config = child(compiler, "configuration") if compiler is not None else None
+        def setting(configuration, name):
+            value = content(configuration, name) or content(config, name) or content(props, "maven.compiler." + name)
+            if value.startswith("${") and value.endswith("}"):
+                value = content(props, value[2:-1])
+            return value
+        executions = child(compiler, "executions") if compiler is not None else None
+        configurations = []
+        default_goals = set()
+        for execution in list(executions) if executions is not None else []:
+            goals = child(execution, "goals")
+            if goals is not None and any((goal.text or "") in {"compile", "testCompile"} for goal in goals):
+                configurations.append(child(execution, "configuration"))
+                if content(execution, "id") in {"default-compile", "default-testCompile"}:
+                    default_goals.update((goal.text or "") for goal in goals)
+        if not {"compile", "testCompile"}.issubset(default_goals):
+            configurations.append(config)
+        if content(project, "packaging") != "pom":
+            for configuration in configurations:
+                value = setting(configuration, "release") or setting(configuration, "target") or setting(configuration, "source")
+                if not value or "${" in value:
+                    raise PortfolioError("effective Maven compiler level is unresolved; configure compiler release/target")
+                java.add(value.removeprefix("1."))
         declared = child(project, "dependencies")
         for dependency in list(declared) if declared is not None else []:
             group, artifact, version = (content(dependency, key) for key in ("groupId", "artifactId", "version"))
@@ -57,7 +73,7 @@ def maven_inventory(path: Path) -> dict[str, Any]:
         parent = child(project, "parent")
         if content(parent, "groupId") == "org.springframework.boot":
             boot.add(content(parent, "version"))
-    return {"java_versions": sorted(java), "spring_boot_versions": sorted(boot), "dependencies": dependencies}
+    return {"java_versions": sorted(java), "spring_boot_versions": sorted(boot), "dependencies": dependencies, "compiler_metadata": metadata}
 
 
 def gradle_script(destination: Path) -> str:
@@ -97,12 +113,15 @@ gradle.projectsEvaluated {
 '''.replace("OUTPUT_FILE", json.dumps(str(destination)))
 
 
-def inventory(build: engine.BuildRoot, directory: Path, timeout: int) -> dict[str, Any]:
+def inventory(build: engine.BuildRoot, directory: Path, timeout: int, effective_pom: Path | None = None) -> dict[str, Any]:
     executable = engine.executable(build)
     if build.tool == "maven":
-        path = directory / "effective-pom.xml"
-        command([executable, "-B", "help:effective-pom", f"-Doutput={path}"], build.path, timeout)
+        path = effective_pom or directory / "effective-pom.xml"
+        if effective_pom is None:
+            command([executable, "-B", "help:effective-pom", f"-Doutput={path}"], build.path, timeout)
         values = maven_inventory(path)
+        for stale in build.path.rglob("target/java-update-dependencies.tgf"):
+            stale.unlink()
         command([executable, "-B", "dependency:tree", "-DoutputType=tgf",
                  "-DoutputFile=target/java-update-dependencies.tgf"], build.path, timeout)
         trees = list(build.path.rglob("target/java-update-dependencies.tgf"))
@@ -133,6 +152,96 @@ def inventory(build: engine.BuildRoot, directory: Path, timeout: int) -> dict[st
     return read_json(path)
 
 
+def report_paths(root: Path, patterns: list[str]) -> list[Path]:
+    paths = sorted({path for pattern in patterns for path in root.glob(pattern) if path.is_file()})
+    for path in paths:
+        if path.is_symlink() or not path.resolve().is_relative_to(root.resolve()):
+            raise PortfolioError("test report points outside the validated build")
+    return paths
+
+
+def clear_reports(root: Path, patterns: list[str]) -> None:
+    tracked = set(git(root, "ls-files", "-z").split("\0"))
+    for path in report_paths(root, patterns):
+        if str(path.relative_to(root)) in tracked:
+            raise PortfolioError("test reports must be generated output, not tracked source")
+        path.unlink()
+
+
+def test_evidence(root: Path, patterns: list[str], suite: str, exemption: str | None, directory: Path) -> dict[str, Any]:
+    counts = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+    reports = []
+    for index, path in enumerate(report_paths(root, patterns)):
+        try:
+            model = ET.parse(path).getroot()
+            suites = [model] if model.tag == "testsuite" else list(model.iter("testsuite"))
+            if not suites:
+                raise ValueError("no test suites")
+            for item in suites:
+                values = {key: int(item.get(key, "0")) for key in counts}
+                if any(value < 0 for value in values.values()) or values["skipped"] > values["tests"]:
+                    raise ValueError("invalid test counts")
+                for key in counts:
+                    counts[key] += values[key]
+        except (ValueError, ET.ParseError) as exc:
+            raise PortfolioError(f"invalid fresh test report: {suite}") from exc
+        data = path.read_bytes()
+        destination = directory / f"{suite}-{index}.xml"
+        destination.write_bytes(data)
+        reports.append({"source": str(path.relative_to(root)), "resource": str(destination), "sha256": hashlib.sha256(data).hexdigest()})
+    if counts["failures"] or counts["errors"]:
+        raise PortfolioError(f"{suite} test reports contain failures/errors")
+    executed = counts["tests"] - counts["skipped"]
+    if executed <= 0 and not exemption:
+        raise PortfolioError(f"{suite} requires fresh executed tests; missing, empty, or entirely skipped reports need a reasoned exemption")
+    return {"suite": suite, "status": "executed" if executed > 0 else "exempted", "reason": exemption if executed <= 0 else None,
+            "counts": counts, "reports": reports, "fresh": True}
+
+
+def verify_validation_evidence(record: dict[str, Any]) -> None:
+    if record.get("evidence_version") != 2 or not record.get("test_evidence"):
+        raise PortfolioError("validation lacks fresh test evidence; rerun validation")
+    resources = list(record.get("inventory_resources", []))
+    for proof in record["test_evidence"]:
+        resources.extend(proof["reports"])
+    for resource in resources:
+        path = Path(resource["resource"])
+        if not path.is_file() or path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != resource["sha256"]:
+            raise PortfolioError("retained validation evidence changed or is missing; rerun validation")
+
+
+def declared_integration(build: engine.BuildRoot, effective_pom: Path | None = None) -> dict[str, Any]:
+    import re
+    suites, tasks = {}, []
+    if build.tool == "maven":
+        for path in [effective_pom] if effective_pom else build.path.rglob("pom.xml"):
+            if effective_pom:
+                model = ET.parse(path).getroot()
+                projects = [model] if model.tag.rsplit("}", 1)[-1] == "project" else list(model)
+            else:
+                if any(part in {"target", ".git"} for part in path.relative_to(build.path).parts):
+                    continue
+                projects = [ET.parse(path).getroot()]
+            for model in projects:
+                configured = child(model, "build")
+                plugins = child(configured, "plugins") if configured is not None else None
+                if plugins is not None and any(content(plugin, "artifactId") == "maven-failsafe-plugin" for plugin in plugins):
+                    suites["integration"] = ["**/target/failsafe-reports/TEST-*.xml"]
+    else:
+        for path in [*build.path.rglob("build.gradle"), *build.path.rglob("build.gradle.kts")]:
+            if any(part in {"build", ".git"} for part in path.relative_to(build.path).parts):
+                continue
+            text = path.read_text()
+            for name in re.findall(r"(?:register|create|named)\s*[<(][^\n]*?['\"]([^'\"]+)['\"]", text):
+                if name != "test" and re.search(r"integration|contract|functional", name, re.I):
+                    tasks.append(name)
+                    suites[name] = [f"**/build/test-results/{name}/TEST-*.xml"]
+            for name in re.findall(r"(?:^|\n)\s*(integrationTest|contractTest|functionalTest)\s*[({]", text):
+                tasks.append(name)
+                suites[name] = [f"**/build/test-results/{name}/TEST-*.xml"]
+    return {"tasks": sorted(set(tasks)), "suites": suites, "reports": [pattern for patterns in suites.values() for pattern in patterns]}
+
+
 def validate_stage(selected: Sequence[Repository], portfolio: Portfolio, config: dict[str, Any], workflow: dict[str, Any], root: Path) -> list[dict[str, Any]]:
     results, discoveries = [], []
     checkouts = {}
@@ -146,7 +255,8 @@ def validate_stage(selected: Sequence[Repository], portfolio: Portfolio, config:
         directory = artifact_path(root, STAGES[4], "repositories", repo.key).parent
         directory.mkdir(parents=True, exist_ok=True)
         result = {"schema_version": 1, "artifact_type": "repository-validation-result", "stage": STAGES[4],
-                  "generated_at": now(), "repository": repo.key, "status": "failed", "checks": []}
+                  "generated_at": now(), "repository": repo.key, "status": "failed", "checks": [],
+                  "diagnostics": str(root / "diagnostics"), "journal": str(root / "events.jsonl"), "toolchains": []}
         try:
             migration = read_json(artifact_path(root, STAGES[3], "repositories", repo.key))
             if migration["status"] != "migrated":
@@ -157,32 +267,88 @@ def validate_stage(selected: Sequence[Repository], portfolio: Portfolio, config:
             if any(path and not any(part in IGNORED for part in Path(path).parts) for path in untracked):
                 raise PortfolioError("migrated output contains uncommitted source files")
             initial_digest = files_digest(output)
-            roots = engine.discover_builds(output, "auto", config.get("discovery", {}).get("max_depth", 5))
+            memberships = []
+            roots = engine.discover_builds(output, "auto", config.get("discovery", {}).get("max_depth", 5), memberships=memberships)
             if not roots:
                 raise PortfolioError("no supported builds found in migrated output")
-            options = workflow["validation"]
-            java, boot, dependencies = set(), set(), []
-            for index, build in enumerate(roots):
+            options = {**workflow["validation"], **workflow["validation"]["repositories"].get(repo.key, {})}
+            names = {str(build.path.relative_to(output)) for build in roots}
+            unknown = (set(options["build_roots"]) | set(options["exclusions"])) - names
+            if unknown:
+                raise PortfolioError(f"unknown independent build roots: {sorted(unknown)}")
+            exclusions = dict(options["exclusions"])
+            if options["build_roots"]:
+                for name in names - set(options["build_roots"]):
+                    if name not in exclusions:
+                        raise PortfolioError(f"unselected build requires an exclusion reason: {name}")
+            required = [build for build in roots if str(build.path.relative_to(output)) not in exclusions]
+            if not required:
+                raise PortfolioError("validation must include at least one independent build")
+            result["scope"] = {"included": [str(build.path.relative_to(output)) for build in required],
+                               "excluded": exclusions, "coverage": "selected-builds" if exclusions else "discovered-builds",
+                               "memberships": memberships}
+            result["test_evidence"] = []
+            java, boot, dependencies, compiler_metadata = set(), set(), [], []
+            inventory_resources = []
+            for index, build in enumerate(required):
                 build_directory = directory / f"build-{index}"
                 build_directory.mkdir(exist_ok=True)
                 executable = engine.executable(build)
-                argv = ([executable, "-B", "test" if options["build"] == "test" else "compile"]
-                        if build.tool == "maven" else [executable, "--no-daemon", "test" if options["build"] == "test" else "classes"])
+                result["toolchains"].append({"build_root": str(build.path.relative_to(output)), "executable": executable,
+                                             "version": command([executable, "--version"], build.path, options["timeout"])})
+                maven = build.tool == "maven"
+                args = [executable, "-B"] if maven else [executable, "--no-daemon", "--rerun-tasks", "--no-build-cache"]
+                unit = ["**/target/surefire-reports/TEST-*.xml"] if maven else ["**/build/test-results/test/TEST-*.xml"]
+                effective_pom = None
+                if maven:
+                    effective_pom = build_directory / "effective-pom.xml"
+                    command([executable, "-B", "help:effective-pom", f"-Doutput={effective_pom}"], build.path, options["timeout"])
+                integration = declared_integration(build, effective_pom)
+                reports = unit + integration["reports"]
+                clear_reports(build.path, reports)
+                task = "verify" if maven and integration["reports"] else "test" if options["build"] == "test" else "compile" if maven else "classes"
+                argv = [*args, task]
+                if not maven and integration["tasks"]:
+                    argv += integration["tasks"]
+                check = {"name": f"build-{index}", "build_root": str(build.path.relative_to(output)), "status": "failed", "command": argv}
+                result["checks"].append(check)
                 command(argv, build.path, options["timeout"])
-                result["checks"].append({"name": f"build-{index}", "status": "passed", "command": argv})
-                values = inventory(build, build_directory, options["timeout"])
+                check["status"] = "passed"
+                for name, globs in [("unit", unit), *[(name, paths) for name, paths in integration["suites"].items()]]:
+                    proof = test_evidence(build.path, globs, name, options["test_exemptions"].get(name), build_directory)
+                    proof.update(build_root=check["build_root"], command=argv)
+                    result["test_evidence"].append(proof)
+                for suite in options["suites"]:
+                    clear_reports(build.path, suite["reports"])
+                    check = {"name": suite["name"], "status": "failed", "command": suite["command"]}
+                    result["checks"].append(check)
+                    command(suite["command"], build.path, options["timeout"])
+                    proof = test_evidence(build.path, suite["reports"], suite["name"], options["test_exemptions"].get(suite["name"]), build_directory)
+                    proof.update(build_root=str(build.path.relative_to(output)), command=suite["command"])
+                    result["test_evidence"].append(proof)
+                    check["status"] = "passed"
+                values = inventory(build, build_directory, options["timeout"], effective_pom)
                 java.update(values["java_versions"])
                 boot.update(values["spring_boot_versions"])
                 dependencies.extend(values["dependencies"])
-            for argv in options["commands"] + options["repositories"].get(repo.key, {}).get("commands", []):
+                compiler_metadata.extend({"build_root": str(build.path.relative_to(output)), **item}
+                                         for item in values.get("compiler_metadata", []))
+                inventory_resources.extend({"resource": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                    for path in build_directory.iterdir() if path.name in {"effective-pom.xml", "effective-gradle.json"} or path.suffix == ".tgf")
+            commands = workflow["validation"]["commands"] + workflow["validation"]["repositories"].get(repo.key, {}).get("commands", [])
+            for argv in commands:
+                check = {"name": "custom", "status": "failed", "command": argv}
+                result["checks"].append(check)
                 command(argv, output, options["timeout"])
-                result["checks"].append({"name": "custom", "status": "passed", "command": argv})
+                check["status"] = "passed"
             if initial_digest != files_digest(output):
                 raise PortfolioError("validation commands modified source; commit changes and rerun validation")
             receipt = read_json(root / "run.json")
             git(output, "merge-base", "--is-ancestor", receipt["sources"][repo.key]["commit"], "HEAD")
             changed_repo = dataclasses.replace(repo, source=str(output), ref=None)
             discovery = discover_repository(changed_repo, config, root, False)
+            discovery["projects"] = [project for project in discovery["projects"] if not any(
+                Path(project.get("path", ".")).is_relative_to(Path(excluded)) for excluded in exclusions)]
             discovery["dependencies"] = dependencies
             discovery["summary"]["java_versions"] = sorted(java)
             discovery["summary"]["spring_boot_versions"] = sorted(boot)
@@ -206,11 +372,15 @@ def validate_stage(selected: Sequence[Repository], portfolio: Portfolio, config:
                            "tree_hash": files_digest(output), "config_hash": receipt["config_hash"],
                            "source_commit": receipt["sources"][repo.key]["commit"],
                            "compatibility_hash": compatibility_hash(config, workflow),
-                           "inventory": {"java_versions": sorted(java), "spring_boot_versions": sorted(boot), "dependencies": dependencies}})
+                           "evidence_version": 2,
+                           "inventory_resources": inventory_resources,
+                           "inventory": {"java_versions": sorted(java), "spring_boot_versions": sorted(boot), "dependencies": dependencies,
+                                         "compiler_metadata": compiler_metadata}})
         except (PortfolioError, OSError, ValueError, KeyError) as exc:
             result["error"] = str(exc)
         write_json(artifact_path(root, STAGES[4], "repositories", repo.key), result)
         results.append(result)
+        event("validation-finished", repository=repo.key, status=result["status"], checks=result["checks"])
     # Store fresh assessment separately from the reviewed original assessment.
     if discoveries:
         members = [checkouts[repo.key] for repo in selected if repo.key in checkouts]

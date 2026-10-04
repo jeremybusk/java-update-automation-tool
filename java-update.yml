@@ -61,6 +61,15 @@ workflow:
     - 04-migration
     - 05-validation
     - 06-publishing
+  source_selection: default        # default branch | current local checkout; --source-selection
+  source_credentials: {}           # Intended source host: token ENV name (no token values)
+  diagnostics:
+    check_bytes: 10485760           # 10 MiB per check; truncation is reported
+    run_bytes: 104857600            # 100 MiB diagnostic text per run
+    retention_days: 30             # Logs expire independently of durable evidence
+  retention:
+    days: 30                       # Explicit prune eligibility; never automatic run deletion
+    pins: []                       # Run IDs or externally referenced evidence paths
   show_diffs: false                 # Compare retained source/policy/output runs
   include_dependencies: false       # Expand selected depends_on recursively
   allow_dependency_override: false  # Manual experiments only; blocks publication
@@ -68,7 +77,11 @@ workflow:
   allow_downgrades: false           # Permit lower dependency pins; still validate
 
   validation:
-    build: test                     # test | compile; required for every build root
+    build: test                     # test | compile; publication also needs test evidence
+    build_roots: []                 # Empty: all independent roots; explicit paths otherwise
+    exclusions: {}                  # Excluded root path: non-empty reason
+    test_exemptions: {}             # Suite name: non-empty reason (e.g. unit for testless BOM)
+    suites: []                      # {name, command: [argv...], reports: [relative XML globs]}
     timeout: 3600                    # Seconds per build/inventory/custom command
     commands: []                    # Global checks, argv lists; never shell strings
     # commands: [["./scripts/contract-test.sh"], ["./scripts/integration-test.sh"]]
@@ -84,7 +97,11 @@ workflow:
     owner: ""                       # GitHub account/org or GitLab namespace path
     prefix: ""                      # Set before autocreate, e.g. "java21-"
     default_branch: main            # Destination/local default, including master→main
-    source_branch: "automation/java-{java}" # Source publishing branch
+    source_branch: "automation/java-{java}-{run_id}" # Unique per run; retry reuses it
+    request:
+      enabled: false                # Optional draft PR/MR after successful src_repo push
+      base: null                    # Captured source default branch or explicit override
+      links: []                     # Optional HTTPS CI/artifact evidence links
     source_default_branch: null     # Explicit host default rename; retains old branch
     private: true
     namespace_id: null              # Optional GitLab namespace ID

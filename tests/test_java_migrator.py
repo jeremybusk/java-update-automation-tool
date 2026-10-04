@@ -35,7 +35,7 @@ class MigratorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "maven" / "module").mkdir(parents=True)
-            (root / "maven" / "pom.xml").write_text("<project/>")
+            (root / "maven" / "pom.xml").write_text("<project><modules><module>module</module></modules></project>")
             (root / "maven" / "module" / "pom.xml").write_text("<project/>")
             (root / "gradle").mkdir()
             (root / "gradle" / "settings.gradle").write_text("")
@@ -44,6 +44,35 @@ class MigratorTests(unittest.TestCase):
                 {(root / "maven", "maven"), (root / "gradle", "gradle")},
                 {(item.path, item.tool) for item in builds},
             )
+
+    def test_gradle_projects_and_composite_builds_have_distinct_membership(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ('app', 'included', 'independent'):
+                (root / name).mkdir()
+                (root / name / 'build.gradle').write_text("plugins { id 'java' }")
+            (root / 'settings.gradle').write_text("include 'app'\nincludeBuild('included')\n")
+            memberships = []
+            builds = jm.discover_builds(root, 'auto', 4, memberships=memberships)
+            self.assertEqual({'.', 'included', 'independent'}, {str(item.path.relative_to(root)) for item in builds})
+            self.assertEqual({('app', 'project'), ('included', 'included-build')}, {(item['member'], item['relationship']) for item in memberships})
+
+    def test_retained_maven_settings_reference_process_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, destination = root / 'user-settings.xml', root / 'retained-settings.xml'
+            source.write_text('<settings><servers><server><id>private</id><username>private-user</username><password>private-secret-value</password></server></servers></settings>')
+            for repository in ('maven-central', 'codegenome'):
+                args = jm.parse_args(['example', '--maven-settings', str(source), '--recipe-repository', repository])
+                env = {'CODE_GENOME_USERNAME': 'recipe-user', 'CODE_GENOME_TOKEN': 'recipe-secret-value'}
+                jm.write_maven_settings(destination, args, env)
+                retained = destination.read_text()
+                self.assertNotIn('private-user', retained)
+                self.assertNotIn('private-secret-value', retained)
+                self.assertNotIn('recipe-secret-value', retained)
+                self.assertIn('private-secret-value', env.values())
+                self.assertIn('${env.', retained)
+                self.assertEqual(0o600, destination.stat().st_mode & 0o777)
 
     def test_generated_recipe_contains_phase_recipes(self):
         with tempfile.TemporaryDirectory() as directory:

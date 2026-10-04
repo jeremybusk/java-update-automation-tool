@@ -70,6 +70,11 @@ def execute_migration(command: list[str]) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env.update({"GIT_AUTHOR_NAME": "Java Update Automation", "GIT_AUTHOR_EMAIL": "java-update@localhost",
                 "GIT_COMMITTER_NAME": "Java Update Automation", "GIT_COMMITTER_EMAIL": "java-update@localhost"})
+    from .operations import CONTEXT, execute
+    if CONTEXT.get():
+        env["JAVA_UPDATE_RUN_ROOT"] = str(CONTEXT.get()["root"])
+        output = execute(command, Path(__file__).resolve().parents[1], env, 3600)
+        return subprocess.CompletedProcess(command, 0, output)
     return subprocess.run(command, cwd=Path(__file__).resolve().parents[1],
                           text=True, env=env, check=False)
 
@@ -138,7 +143,7 @@ def migration_stage(selected: Sequence[Any], portfolio: Any, config: dict[str, A
                     completed = execute_migration(command)
                     result.update({"executed": True, "exit_code": completed.returncode,
                                    "status": "complete" if completed.returncode == 0 else "failed"})
-                except OSError as exc:
+                except (OSError, PortfolioError) as exc:
                     result.update({"status": "failed", "error": str(exc)})
         if managed:
             import java_migrator as engine

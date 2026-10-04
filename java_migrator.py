@@ -276,6 +276,18 @@ def run(
     command: Sequence[str], *, cwd: Path, env: dict[str, str], log: Path,
     timeout: int, display: str | None = None,
 ) -> None:
+    if env.get("JAVA_UPDATE_RUN_ROOT"):
+        from java_update_tool.operations import execute, session
+        from java_update_tool.core import PortfolioError, read_json
+        root = Path(env["JAVA_UPDATE_RUN_ROOT"])
+        try:
+            with session(root, read_json(root / "run.json")["workflow"]):
+                output = execute(list(command), cwd, env, timeout)
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text(output + "\n")
+        except PortfolioError as exc:
+            raise MigrationError(str(exc)) from exc
+        return
     log.parent.mkdir(parents=True, exist_ok=True)
     shown = display or shlex.join(command)
     with log.open("a", encoding="utf-8") as stream:
@@ -478,7 +490,8 @@ def isolate_from_parent_git(root: Path):
             marker.unlink(missing_ok=True)
 
 
-def discover_builds(root: Path, requested: str, max_depth: int) -> list[BuildRoot]:
+def discover_builds(root: Path, requested: str, max_depth: int,
+                    memberships: list[dict[str, str]] | None = None) -> list[BuildRoot]:
     ignored = {".git", ".gradle", ".idea", ".migration-work", "build", "target", "node_modules"}
     candidates: list[BuildRoot] = []
     for current, dirs, files in os.walk(root):
@@ -493,11 +506,52 @@ def discover_builds(root: Path, requested: str, max_depth: int) -> list[BuildRoo
         for tool in tools:
             if requested == "auto" or requested == tool:
                 candidates.append(BuildRoot(here, tool))
-    # Nested POMs/build.gradle files are normally modules of the nearest same-tool root.
-    roots = []
-    for candidate in sorted(candidates, key=lambda item: len(item.path.parts)):
-        if not any(existing.tool == candidate.tool and existing.path in candidate.path.parents for existing in roots):
-            roots.append(candidate)
+    # Only declared membership establishes coverage by a parent build. Nested
+    # standalone builds (including composite Gradle builds) need their own checks.
+    members: set[tuple[Path, str]] = set()
+    for candidate in candidates:
+        if candidate.tool == "maven":
+            try:
+                model = ET.parse(candidate.path / "pom.xml").getroot()
+                properties = {local_name(item): (item.text or "").strip() for element in model
+                              if local_name(element) == "properties" for item in element}
+                for element in model:
+                    if local_name(element) != "modules":
+                        continue
+                    for module in element:
+                        value = (module.text or "").strip()
+                        for key, replacement in properties.items():
+                            value = value.replace("${" + key + "}", replacement)
+                        if value and "${" not in value:
+                            member = (candidate.path / value).resolve()
+                            members.add((member, "maven"))
+                            if memberships is not None:
+                                memberships.append({"parent": str(candidate.path.relative_to(root)),
+                                    "member": os.path.relpath(member, root), "tool": "maven", "relationship": "module"})
+            except (OSError, ET.ParseError):
+                pass  # Invalid models fail during build execution; never hide children.
+        else:
+            for settings in (candidate.path / "settings.gradle", candidate.path / "settings.gradle.kts"):
+                if not settings.is_file():
+                    continue
+                text = re.sub(r"(?m)//.*$", "", settings.read_text())
+                for match in re.finditer(r"(?m)^\s*include(?!Build)\s*(?:\(([^\n]*?)\)|([^\n]+))", text):
+                    for name in re.findall(r"['\"]([^'\"]+)['\"]", match.group(1) or match.group(2)):
+                        directory = candidate.path / name.strip(":").replace(":", "/")
+                        override = re.search(r"project\(['\"]:?" + re.escape(name.strip(":")) + r"['\"]\)\.projectDir\s*=\s*(?:file|new File)\(['\"]([^'\"]+)", text)
+                        if override:
+                            directory = candidate.path / override.group(1)
+                        members.add((directory.resolve(), "gradle"))
+                        if memberships is not None:
+                            memberships.append({"parent": str(candidate.path.relative_to(root)),
+                                "member": os.path.relpath(directory.resolve(), root), "tool": "gradle", "relationship": "project"})
+                if memberships is not None:
+                    for value in re.findall(r"includeBuild\s*\(?\s*['\"]([^'\"]+)['\"]", text):
+                        memberships.append({"parent": str(candidate.path.relative_to(root)),
+                            "member": os.path.relpath((candidate.path / value).resolve(), root),
+                            "tool": "gradle", "relationship": "included-build"})
+    roots = [candidate for candidate in sorted(candidates, key=lambda item: len(item.path.parts))
+             if (candidate.path.resolve(), candidate.tool) not in members]
     if not roots:
         raise MigrationError(f"no {requested if requested != 'auto' else 'Maven or Gradle'} build found within depth {max_depth}")
     return roots
@@ -934,10 +988,13 @@ def write_maven_settings(path: Path, args: argparse.Namespace, env: dict[str, st
     source = args.maven_settings or Path.home() / ".m2" / "settings.xml"
     remote = remote_recipe_repository(args)
     if not remote:
-        if source.is_file():
-            shutil.copyfile(source, path)
-        else:
-            path.write_text('<?xml version="1.0" encoding="UTF-8"?>\n<settings/>\n', encoding="utf-8")
+        root = ET.parse(source).getroot() if source.is_file() else ET.Element("settings")
+        for index, node in enumerate(root.iter()):
+            if local_name(node) in {"password", "passphrase", "username"} and node.text and "${" not in node.text:
+                name = f"JAVA_UPDATE_MAVEN_SECRET_{index}"
+                env[name] = node.text
+                node.text = "${env." + name + "}"
+        ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
         path.chmod(stat.S_IRUSR | stat.S_IWUSR)
         return
     try:
@@ -954,8 +1011,8 @@ def write_maven_settings(path: Path, args: argparse.Namespace, env: dict[str, st
                 servers.remove(server)
         server = ET.SubElement(servers, xml_name(root, "server"))
         xml_add(server, "id", repository_id)
-        xml_add(server, "username", username)
-        xml_add(server, "password", token)
+        xml_add(server, "username", "${env.CODE_GENOME_USERNAME}")
+        xml_add(server, "password", "${env.CODE_GENOME_TOKEN}")
     profiles = xml_get_or_add(root, "profiles")
     profile = ET.SubElement(profiles, xml_name(root, "profile"))
     profile_id = "java-migrator-recipes"
@@ -967,6 +1024,12 @@ def write_maven_settings(path: Path, args: argparse.Namespace, env: dict[str, st
         xml_add(item, "url", remote)
     active = xml_get_or_add(root, "activeProfiles")
     xml_add(active, "activeProfile", profile_id)
+    # Keep copied user credentials in the process environment, not retained settings.
+    for index, node in enumerate(root.iter()):
+        if local_name(node) in {"password", "passphrase", "username"} and node.text and "${" not in node.text:
+            name = f"JAVA_UPDATE_MAVEN_SECRET_{index}"
+            env[name] = node.text
+            node.text = "${env." + name + "}"
     ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
     path.chmod(stat.S_IRUSR | stat.S_IWUSR)
 
@@ -1020,6 +1083,20 @@ def diagnostic_command(
     executable_path = shutil.which(command[0], path=env.get("PATH"))
     if executable_path is None:
         return CheckResult(name, "skipped", list(command), output=f"{command[0]} is not installed")
+    if env.get("JAVA_UPDATE_RUN_ROOT"):
+        from java_update_tool.operations import CONTEXT, execute, session, redact
+        from java_update_tool.core import PortfolioError, read_json
+        root = Path(env["JAVA_UPDATE_RUN_ROOT"])
+        with session(root, read_json(root / "run.json")["workflow"]):
+            try:
+                output = execute(list(command), build.path, env, min(args.timeout, 600), include_stderr=True)
+                metadata = CONTEXT.get()["last_check"]
+                warning = warn_on_output and bool(output.strip())
+            except PortfolioError as exc:
+                output, warning = str(exc), True
+                metadata = CONTEXT.get().get("last_check", {})
+            output = output[-12_000:] + ("\nDiagnostics: " + metadata["log"] if metadata.get("log") else "")
+            return CheckResult(name, "warning" if warning else "passed", redact(list(command), env), metadata.get("exit_code"), output)
     try:
         completed = subprocess.run(
             list(command), cwd=build.path, env=env, stdout=subprocess.PIPE,

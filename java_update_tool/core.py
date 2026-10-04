@@ -11,6 +11,7 @@ import os
 import re
 import stat
 import subprocess
+import tempfile
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -194,9 +195,16 @@ def artifact_path(state: Path, stage: str, kind: str, key: str) -> Path:
 
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2, sort_keys=False) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    descriptor, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(value, indent=2, sort_keys=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -773,6 +781,22 @@ def markdown_for_validation(data: dict[str, Any]) -> str:
     lines += ["", "## Required checks", ""]
     for check in data.get("checks", []):
         lines.append(f"- [{'x' if check['status'] == 'passed' else ' '}] {check['name']}: `{' '.join(check['command'])}`")
+    scope = data.get("scope", {})
+    for name in ("diagnostics", "journal"):
+        if data.get(name):
+            lines.append(f"- {name.capitalize()}: `{data[name]}`")
+    if scope:
+        lines += ["", "## Validation scope", "", f"- Coverage: {scope['coverage']}", "- Included builds: " + ", ".join(scope['included'])]
+        for name, reason in scope["excluded"].items():
+            lines.append(f"- Excluded build `{name}`: {reason}")
+        for membership in scope.get("memberships", []):
+            lines.append(f"- Build relationship: `{membership['parent']}` → `{membership['member']}` ({membership['relationship']})")
+    if data.get("test_evidence"):
+        lines += ["", "## Fresh test evidence", ""]
+        for proof in data["test_evidence"]:
+            lines.append(f"- {proof['suite']} ({proof['build_root']}): **{proof['status']}**; {proof['counts']}")
+            if proof.get("reason"):
+                lines.append("  Exemption: " + proof["reason"])
     inventory = data.get("inventory", {})
     if inventory:
         lines += ["", f"- Effective Java: {', '.join(inventory['java_versions'])}",
@@ -791,6 +815,11 @@ def markdown_for_publishing(data: dict[str, Any]) -> str:
         for key in ("url", "branch", "commit", "error"):
             if key in target:
                 lines.append(f"  - {key}: `{target[key]}`")
+    if data.get("request"):
+        request = data["request"]
+        lines += ["", f"- Review request: **{request['status']}** {request.get('url', '')}"]
+        if request.get("error"):
+            lines.append("- Request error: " + request["error"])
     return "\n".join(lines) + "\n"
 
 

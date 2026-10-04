@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import contextlib
 import os
 import subprocess
 import urllib.error
@@ -11,8 +12,28 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .core import PortfolioError, Repository, STAGES, artifact_path, now, read_json, write_json
-from .runs import command, files_digest, git, git_credentials
+from .runs import command, files_digest, git, git_credentials, source_auth, ref_manifest, canonical
+from .operations import lock, event, redact, destination_identity
 from .policy import validate_location
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise PortfolioError("provider redirect refused; configure the intended API host")
+
+
+def remote_auth(url: str, options: dict[str, Any], workflow: dict[str, Any], target: str):
+    if target == "src_repo":
+        return source_auth(url, workflow)
+    api = urllib.parse.urlparse(options.get("api_url") or ("https://api.github.com" if options["provider"] == "github" else "https://gitlab.com/api/v4"))
+    expected = "github.com" if api.hostname == "api.github.com" else api.hostname
+    token = ""
+    if urllib.parse.urlparse(url).scheme == "https" and urllib.parse.urlparse(url).hostname == expected:
+        try:
+            token = Provider(options).token
+        except PortfolioError:
+            pass
+    return git_credentials(token, url)
 
 
 class Provider:
@@ -41,7 +62,7 @@ class Provider:
         request = urllib.request.Request(self.base.rstrip("/") + path, data=json.dumps(data).encode() if data is not None else None,
                                          headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
             if missing and exc.code == 404:
@@ -86,16 +107,43 @@ class Provider:
         self.request("PATCH" if self.kind == "github" else "PUT", self.path(owner, name), {"default_branch": branch})
 
 
-def full_history(output: Path, source: dict[str, Any], scope: str) -> None:
+def full_history(output: Path, source: dict[str, Any], scope: str, workflow: dict[str, Any] | None = None) -> None:
     if not source["has_remote"]:
         return
-    if git(output, "rev-parse", "--is-shallow-repository") == "true":
-        git(output, "fetch", "--unshallow", "--no-tags", source["source"])
-    if scope == "all":
-        git(output, "fetch", "--tags", source["source"], "+refs/heads/*:refs/java-update/source/*")
-    else:
-        branch = source["default_branch"]
-        git(output, "fetch", "--no-tags", source["source"], f"+refs/heads/{branch}:refs/java-update/source/{branch}")
+    if not source.get("ref_manifest"):
+        raise PortfolioError("saved source lacks immutable refs; start a new run")
+    options = workflow or {}
+    repo = Repository("source", source["source"], "source", "source")
+    with source_auth(source["source"], options):
+        current = ref_manifest(repo, scope, source["default_branch"])
+        # The explicitly planned source-publication refs can have been created by
+        # an earlier successful push before another operation failed.
+        generated = {"refs/heads/" + source["migration_branch"]: git(output, "rev-parse", "HEAD")}
+        previous_heads = set()
+        publishing_receipt = artifact_path(Path(source["snapshot"]).parent.parent, STAGES[5], "repositories", Path(source["snapshot"]).name)
+        if publishing_receipt.exists():
+            saved = read_json(publishing_receipt)
+            records = [saved.get("targets", {}).get("src_repo", {})]
+            records += [item["receipt"] for item in saved.get("history", []) if item["target"] == "src_repo"]
+            for record in records:
+                head = record.get("git_receipt", {}).get("refs", {}).get(source["migration_branch"])
+                if head:
+                    git(output, "merge-base", "--is-ancestor", head, "HEAD")
+                    previous_heads.add(head)
+        rename = options.get("publishing", {}).get("source_default_branch")
+        if rename:
+            generated["refs/heads/" + rename] = source["default_commit"]
+        for ref, sha in generated.items():
+            owned_heads = previous_heads if ref == "refs/heads/" + source["migration_branch"] else set()
+            if ref not in source["ref_manifest"] and current.get(ref) in {sha, *owned_heads}:
+                current.pop(ref)
+        if current != source["ref_manifest"]:
+            raise PortfolioError("captured source refs changed; start a new reviewed run")
+        if git(output, "rev-parse", "--is-shallow-repository") == "true":
+            git(output, "fetch", "--unshallow", "--no-tags", source["source"], source["commit"])
+        for ref, sha in source["ref_manifest"].items():
+            destination = ref if ref.startswith("refs/tags/") else "refs/java-update/source/" + ref.removeprefix("refs/heads/")
+            git(output, "fetch", "--no-tags", source["source"], f"{sha}:{destination}")
     if git(output, "rev-parse", "--is-shallow-repository") == "true":
         raise PortfolioError("source cannot provide full history; publishing remains blocked")
 
@@ -155,22 +203,35 @@ def publish_stage(selected: Sequence[Repository], config: dict[str, Any], workfl
         if files_digest(output) != value["tree_hash"] or git(output, "rev-parse", "HEAD") != value["commit"]:
             raise PortfolioError(f"validated output changed: {repo.key}; rerun validation")
         options = {**publishing, **publishing["repositories"].get(repo.key, {})}
+        options["request"] = {**publishing["request"], **options["request"]}
         branch = options["default_branch"]
         git(output, "check-ref-format", "--branch", branch)
-        source_branch = options["source_branch"].format(java=config["targets"]["java"]["desired"])
+        source_branch = receipt["sources"][repo.key]["migration_branch"]
         git(output, "check-ref-format", "--branch", source_branch)
         try:
-            full_history(output, receipt["sources"][repo.key], publishing["history"])
+            full_history(output, receipt["sources"][repo.key], publishing["history"], {**workflow, "publishing": options})
         except PortfolioError as exc:
             result.update({"status": "failed", "error": f"full history could not be obtained: {exc}"})
             write_json(path, result)
             results.append(result)
             continue
         for target in publishing["targets"]:
-            if result["targets"].get(target, {}).get("status") == "published":
-                continue
             target_result = result["targets"].get(target, {})
+            plan_hash = canonical({"target": target, "options": options, "history": receipt["sources"][repo.key]["ref_manifest"]})
+            unchanged = target_result.get("commit") == value["commit"] and target_result.get("tree_hash") == value["tree_hash"] and target_result.get("plan_hash") == plan_hash
+            if target_result.get("status") == "published" and not unchanged:
+                result.setdefault("history", []).append({"target": target, "receipt": dict(target_result)})
+                target_result = {key: item for key, item in target_result.items() if key in {"destination", "url", "branch"}}
+            guard = contextlib.ExitStack()
             try:
+                from .validation import verify_validation_evidence
+                verify_validation_evidence(value)
+                api = urllib.parse.urlparse(options.get("api_url") or ("https://api.github.com" if options["provider"] == "github" else "https://gitlab.com/api/v4"))
+                host = "github.com" if api.hostname == "api.github.com" else api.netloc
+                location = str(root / "local-repositories" / repo.key) if target == "local_repo" else repo.source if target == "src_repo" else options.get("url") or f"https://{host}/{options['owner']}/{options.get('name') or options['prefix'] + repo.repo_name}"
+                identity = destination_identity(location)
+                guard.enter_context(lock(root.parent.parent / ".locks", "destination:" + identity, f"publish {root.name} {repo.key} {target}"))
+                event("publishing-started", repository=repo.key, target=target, commit=value["commit"])
                 if target == "local_repo":
                     local = root / "local-repositories" / repo.key
                     extra = {}
@@ -194,6 +255,19 @@ def publish_stage(selected: Sequence[Repository], config: dict[str, Any], workfl
                         git(local, "checkout", "-B", branch, value["commit"])
                         if previous_branch and previous_branch != branch:
                             git(local, "branch", "-d", previous_branch)
+                    elif git(local, "rev-parse", "HEAD") != value["commit"]:
+                        if git(local, "status", "--porcelain") or git(local, "branch", "--show-current") != branch:
+                            raise PortfolioError("retained local repository has human changes or a different checkout")
+                        git(local, "fetch", "--no-tags", str(output), value["commit"])
+                        git(local, "merge-base", "--is-ancestor", "HEAD", value["commit"])
+                        git(local, "merge", "--ff-only", value["commit"])
+                    if publishing["history"] == "all":
+                        for ref, sha in receipt["sources"][repo.key]["ref_manifest"].items():
+                            if ref.startswith("refs/tags/"):
+                                existing_tag = git(local, "for-each-ref", "--format=%(objectname)", ref)
+                                if existing_tag and existing_tag != sha:
+                                    raise PortfolioError(f"local tag differs: {ref}")
+                                git(local, "fetch", "--no-tags", str(output), f"{sha}:{ref}")
                     for name, sha in extra.items():
                         existing_local = git(local, "for-each-ref", "--format=%(objectname)", "refs/heads/" + name)
                         if existing_local and existing_local != sha:
@@ -227,18 +301,17 @@ def publish_stage(selected: Sequence[Repository], config: dict[str, Any], workfl
                             write_json(path, result)  # Preserve creation before a potentially failed push.
                             url = destination["url"]
                         # Preflight every branch/tag before sending any of them.
-                    token = ""
-                    if url.startswith("https://"):
-                        try:
-                            token = Provider(options).token
-                        except PortfolioError:
-                            pass  # Existing Git credential helpers remain supported.
-                    with git_credentials(token, url):
+                    actual_identity = destination_identity(url)
+                    if actual_identity != identity:
+                        guard.enter_context(lock(root.parent.parent / ".locks", "destination:" + actual_identity, f"publish {root.name} {repo.key} {target}"))
+                    full_history(output, receipt["sources"][repo.key], publishing["history"], {**workflow, "publishing": options})
+                    with remote_auth(url, options, workflow, target):
                         refs = {remote_branch: value["commit"]}
                         renamed_source = options.get("source_default_branch") if target == "src_repo" else None
                         if renamed_source:
                             source_owner, source_name = provider_location(url)
-                            source_provider = Provider(options)
+                            from .reviews import source_provider_options
+                            source_provider = Provider(source_provider_options(url, options, workflow))
                             git(output, "check-ref-format", "--branch", renamed_source)
                             default = receipt["sources"][repo.key]["default_branch"]
                             tip = command(["git", "ls-remote", "--heads", url, "refs/heads/" + default], output)
@@ -273,20 +346,35 @@ def publish_stage(selected: Sequence[Repository], config: dict[str, Any], workfl
                                 if ref in existing and existing[ref] != sha:
                                     raise PortfolioError(f"destination tag differs: {ref}")
                                 refspecs.append(f"{sha}:{ref}")
-                        command(["git", "push", "--atomic", "--", url, *refspecs], output)
+                        matches = all(existing.get(spec.split(":", 1)[1]) == spec.split(":", 1)[0] for spec in refspecs)
+                        if not matches:
+                            command(["git", "push", "--atomic", "--", url, *refspecs], output)
+                        target_result["git_receipt"] = {"commit": value["commit"], "refs": dict(refs), "url": url}
+                        result["targets"][target] = target_result
+                        write_json(path, result)
                         if target == "dst_repo" and target_result.get("destination"):
                             destination = target_result["destination"]
                             Provider(options).default_branch(destination["owner"], destination["name"], remote_branch)
                         if renamed_source:
                             source_provider.default_branch(source_owner, source_name, renamed_source)
                     target_result.update({"url": url, "branch": remote_branch})
-                target_result.update({"status": "published", "commit": value["commit"], "published_at": now()})
+                target_result.update({"status": "published", "commit": value["commit"], "tree_hash": value["tree_hash"], "plan_hash": plan_hash,
+                                      "published_at": target_result.get("published_at", now())})
                 target_result.pop("error", None)
             except (PortfolioError, OSError, ValueError) as exc:
                 target_result.update({"status": "failed", "error": str(exc)})
+            finally:
+                guard.close()
             result["targets"][target] = target_result
             write_json(path, result)
+            event("publishing-finished", repository=repo.key, target=target, status=target_result["status"])
+        request_options = {**publishing["request"], **options.get("request", {})}
+        if request_options["enabled"] and result["targets"].get("src_repo", {}).get("status") == "published":
+            from .reviews import ensure_request
+            result["request"] = ensure_request(repo, options, workflow, receipt["sources"][repo.key], value, root, result.get("request", {}))
         result["status"] = "published" if all(result["targets"].get(target, {}).get("status") == "published" for target in publishing["targets"]) else "failed"
+        if result.get("request", {}).get("status") == "failed":
+            result["status"] = "failed"
         write_json(path, result)
         results.append(result)
     return results

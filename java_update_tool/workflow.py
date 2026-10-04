@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import contextlib
 import sys
 from pathlib import Path
 from typing import Any, Sequence
@@ -13,6 +14,8 @@ from .policy import workflow_policy, target_recipes, resolve_pin, numeric_versio
 from .runs import approve, canonical, check_approvals, compare_runs, create_run, run_directory, snapshots, git, files_digest, source_commit
 from .validation import validate_stage
 from .publishing import publish_stage
+from .operations import lock, session, event, versions, redact
+from .maintenance import export_evidence, prune
 
 
 def parser() -> argparse.ArgumentParser:
@@ -30,6 +33,8 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--dependency-override", action=argparse.BooleanOptionalAction, default=None)
     run.add_argument("--enable-publishing", action=argparse.BooleanOptionalAction, default=None)
     run.add_argument("--publish-target", action="append", choices=("local_repo", "src_repo", "dst_repo"))
+    run.add_argument("--source-selection", choices=("default", "current"))
+    run.add_argument("--draft-request", action=argparse.BooleanOptionalAction, default=None)
     commands.choices["report"].add_argument("--run-id", default="latest")
     approval = commands.add_parser("approve", help="approve an unchanged completed stage")
     approval.add_argument("run_id")
@@ -38,6 +43,11 @@ def parser() -> argparse.ArgumentParser:
     diff = commands.add_parser("diff", help="compare source, output, and policy between runs")
     diff.add_argument("run_id")
     diff.add_argument("--compare-to", required=True)
+    export = commands.add_parser("export-evidence", help="export redacted, portable inspection evidence")
+    export.add_argument("run_id")
+    export.add_argument("--output", type=Path, required=True)
+    cleanup = commands.add_parser("prune", help="inspect retained-run cleanup; dry-run unless --apply")
+    cleanup.add_argument("--apply", action="store_true")
     return result
 
 
@@ -68,6 +78,8 @@ def dependencies_ready(selected: Sequence[Any], portfolio: Any, options: dict[st
                 if not evidence:
                     raise PortfolioError("missing dependency evidence")
                 record = read_json(Path(evidence).expanduser().resolve())
+                from .validation import verify_validation_evidence
+                verify_validation_evidence(record)
                 output = Path(record["output"])
                 if record["status"] != "validated" or git(output, "rev-parse", "HEAD") != record["commit"] or files_digest(output) != record["tree_hash"]:
                     raise PortfolioError("dependency evidence changed or failed")
@@ -117,6 +129,7 @@ def checkpoint(root: Path, stage: str, options: dict[str, Any]) -> bool:
     receipt = read_json(root / "run.json")
     print(f"[{stage}] resources: {root / stage}")
     print(f"[{stage}] reports: {root / 'reports' / stage}")
+    print(f"[{stage}] diagnostics: {root / 'diagnostics'}; journal: {root / 'events.jsonl'}")
     if options["mode"] == "unattended" or stage not in options["checkpoints"]:
         return True
     if stage in receipt["approvals"]:
@@ -135,19 +148,34 @@ def checkpoint(root: Path, stage: str, options: dict[str, Any]) -> bool:
 
 def main(argv: Sequence[str] | None = None) -> int:
     root = None
+    executing = False
+    stack = contextlib.ExitStack()
     try:
         args = parser().parse_args(argv)
         state = args.state.resolve()
+        if args.command == "prune":
+            options = workflow_policy(load_config(args.config.resolve()))
+            for decision in prune(state, options, args.apply):
+                print(f"{decision['run']}: {decision['action']} {'; '.join(decision['reasons'])}")
+            return 0
+        if args.command == "export-evidence":
+            root = run_directory(state, args.run_id)
+            stack.enter_context(lock(state / ".locks", str(root.resolve()), "export-evidence"))
+            print(export_evidence(root, args.output.resolve()))
+            return 0
         if args.command == "runs":
             for path in sorted((state / "runs").glob("*/run.json")):
                 receipt = read_json(path)
                 print(f"{receipt['run_id']} {receipt['status']} {','.join(receipt['selected'])}")
             return 0
         if args.command == "diff":
-            print(compare_runs(run_directory(state, args.run_id), run_directory(state, args.compare_to)))
+            root = run_directory(state, args.run_id)
+            stack.enter_context(lock(state / ".locks", str(root.resolve()), "diff"))
+            print(compare_runs(root, run_directory(state, args.compare_to)))
             return 0
         if args.command == "approve":
             root = run_directory(state, args.run_id)
+            stack.enter_context(lock(state / ".locks", str(root.resolve()), "approve"))
             config = load_config(args.config.resolve())
             if canonical(config) != read_json(root / "run.json")["config_hash"]:
                 raise PortfolioError("policy changed; start a new run")
@@ -163,13 +191,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise PortfolioError("invalid targets: " + "; ".join(errors))
         overrides = {}
         if args.command == "run":
-            for name, field in (("mode", "mode"), ("show_diffs", "show_diffs"), ("include_dependencies", "include_dependencies"), ("dependency_override", "allow_dependency_override")):
+            for name, field in (("mode", "mode"), ("source_selection", "source_selection"), ("show_diffs", "show_diffs"), ("include_dependencies", "include_dependencies"), ("dependency_override", "allow_dependency_override")):
                 if getattr(args, name) is not None:
                     overrides[field] = getattr(args, name)
             if args.enable_publishing is not None:
                 overrides["publishing"] = {"enabled": args.enable_publishing}
             if args.publish_target:
                 overrides.setdefault("publishing", {})["targets"] = args.publish_target
+            if args.draft_request is not None:
+                overrides.setdefault("publishing", {})["request"] = {"enabled": args.draft_request}
         options = workflow_policy(config, overrides)
         for area in ("validation", "publishing"):
             unknown = set(options[area]["repositories"]) - {repo.key for repo in portfolio.repositories}
@@ -181,12 +211,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         selected = cli._selected(args, portfolio)
         if args.command == "report":
-            print(f"Generated {len(render_reports(run_directory(state, args.run_id), selected))} reports")
+            root = run_directory(state, args.run_id)
+            stack.enter_context(lock(state / ".locks", str(root.resolve()), "report"))
+            print(f"Generated {len(render_reports(root, selected))} reports")
             return 0
         if options["include_dependencies"]:
             selected = expand_dependencies(selected, portfolio)
         if args.resume:
             root = run_directory(state, args.resume)
+            stack.enter_context(lock(state / ".locks", str(root.resolve()), "run --resume"))
             receipt = read_json(root / "run.json")
             if canonical(config) != receipt["config_hash"] or options != receipt["workflow"]:
                 raise PortfolioError("source policy or CLI overrides changed; start a new run")
@@ -201,6 +234,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.from_stage and args.from_stage != STAGES[0]:
                 raise PortfolioError("starting from an upstream stage requires --resume RUN_ID")
             root = create_run(state, selected, config, options)
+            stack.enter_context(lock(state / ".locks", str(root.resolve()), "run"))
+        stack.enter_context(session(root, options))
+        event("invocation", command="run", resumed=bool(args.resume))
         print(f"Run: {root.name}")
         receipt = read_json(root / "run.json")
         start = STAGES.index(args.from_stage) if args.from_stage else next((i for i, stage in enumerate(STAGES) if receipt["stages"].get(stage, {}).get("status") not in {"complete", "partial"} and not (receipt["stages"].get(stage, {}).get("status") == "prepared" and not args.execute)), len(STAGES))
@@ -215,10 +251,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         pending = receipt.get("pending_review")
         if pending and pending not in receipt["approvals"] and not checkpoint(root, pending, options):
             return 3
+        executing = True
+        if not (root / "tool-versions.json").exists():
+            versions(root)
         source_portfolio, sources = snapshots(root, portfolio, selected)
         discoveries = []
         for index in range(start, end + 1):
             stage = STAGES[index]
+            event("stage-started", stage=stage)
             check_approvals(root)
             current = read_json(root / "run.json")
             for later in STAGES[index:]:
@@ -261,6 +301,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             receipt["status"] = "failed" if failed else "running"
             receipt["exit_code"] = 1 if failed else 0
             write_json(root / "run.json", receipt)
+            event("stage-finished", stage=stage, status=receipt["stages"][stage]["status"])
             render_reports(root, selected)
             if options["show_diffs"]:
                 previous = [path.parent for path in sorted((state / "runs").glob("*/run.json")) if path.parent != root]
@@ -281,9 +322,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         write_json(root / "run.json", receipt)
         return 0
     except (PortfolioError, OSError, ValueError, KeyError) as exc:
-        if root:
+        event("invocation-failed" if executing else "invocation-rejected", root, error=str(exc))
+        if root and executing:
             receipt = read_json(root / "run.json")
-            receipt.update({"status": "failed", "error": str(exc), "exit_code": 2})
+            receipt.update({"status": "failed", "error": redact(str(exc)), "exit_code": 2})
             write_json(root / "run.json", receipt)
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {redact(str(exc))}", file=sys.stderr)
         return 2
+    finally:
+        stack.close()

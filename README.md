@@ -45,9 +45,14 @@ python3 portfolio.py run --mode unattended --all --through 06-publishing --execu
 python3 portfolio.py runs
 python3 portfolio.py diff RUN_ID --compare-to PREVIOUS_RUN_ID
 python3 portfolio.py report --run-id latest
+python3 portfolio.py export-evidence RUN_ID --output evidence.tar.gz
+python3 portfolio.py prune                   # Show retention and protected resources
+python3 portfolio.py prune --apply           # Delete only eligible retained runs
 ```
 
 Remote publishing also requires `workflow.publishing.enabled: true` and a selected remote target. Nothing is pushed merely by running migration or validation.
+
+Validation requires fresh executed tests and effective compiler/dependency evidence. Independent nested builds are included unless explicitly excluded with a reason. Optional draft GitHub/GitLab requests summarize the validated scope after source-branch publication. Captured refs, exclusive locks, exact publishing receipts, redacted diagnostics, and an operational journal make interrupted runs inspectable and retryable.
 
 ## Configuration
 
@@ -65,6 +70,6 @@ See [the workflow guide](notes/workflow.md) for complete config examples, creden
 python3 -B -m unittest discover -s tests -v
 ```
 
-Normal tests use temporary Git repositories, deterministic migration/build boundaries, and local fake hosting APIs. The opt-in integration suite runs real Maven/Gradle migrations and requires a suitable JDK, build tools, and network access.
+Normal tests use temporary Git repositories, deterministic migration/build boundaries, and local fake hosting APIs. The opt-in integration matrix covers Maven/Gradle Java 17→21 and 8→25, BOMs, multi-project builds, catalogs, and Spring Boot 3.4→3.5→4.0. GitHub CI runs authenticated Boot checks with `CODE_GENOME_USERNAME` and `CODE_GENOME_TOKEN` secrets on trusted jobs; missing prerequisites fail required checks. See the workflow guide for the precise fixture and toolchain matrix.
 
 `migrate.py` remains available for direct OpenRewrite execution. `portfolio.py --legacy` preserves the previous four-stage state layout and command behavior. The reusable [report skill](skills/java-update-reports/SKILL.md) regenerates Markdown from retained JSON.

@@ -1,0 +1,150 @@
+name: Migration checks
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+  release:
+    types: [published]
+permissions:
+  contents: read
+concurrency:
+  group: migration-checks-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+jobs:
+  fast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt jsonschema
+      - run: python -m unittest discover -s tests -v
+      - run: python portfolio.py validate
+      - run: python -c "import json,yaml,jsonschema; jsonschema.validate(yaml.safe_load(open('java-update.yml')),json.load(open('schemas/java-update.schema.json')))"
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      native: ${{ steps.scope.outputs.native }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: scope
+        env:
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          CI_EVENT: ${{ github.event_name }}
+          CI_REF: ${{ github.ref }}
+        run: |
+          python - <<'PY'
+          import os, subprocess
+          base = os.environ['CI_BASE_SHA']
+          required = os.environ['CI_EVENT'] in {'workflow_dispatch', 'release'} or os.environ['CI_REF'].startswith('refs/tags/') or not base or set(base) == {'0'}
+          if not required:
+              changed = subprocess.check_output(['git', 'diff', '--name-only', base, 'HEAD'], text=True).splitlines()
+              required = any(path.startswith(('java_update_tool/', 'tests/', '.github/', 'scripts/')) or path in {'java_migrator.py','portfolio.py','java-update.yml','requirements.txt'} for path in changed)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as handle:
+              handle.write('native=' + str(required).lower() + '\n')
+          PY
+  native:
+    needs: [fast, changes]
+    if: needs.changes.outputs.native == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {case: maven17, java: '21', gradle: '8.14.3'}
+          - {case: gradle17, java: '21', gradle: '8.14.3'}
+          - {case: maven8, java: '25', gradle: '9.1.0'}
+          - {case: gradle8, java: '25', gradle: '9.1.0'}
+          - {case: maven-bom, java: '21', gradle: '8.14.3'}
+          - {case: maven-multi, java: '21', gradle: '8.14.3'}
+          - {case: gradle-catalog, java: '21', gradle: '8.14.3'}
+          - {case: gradle-multi, java: '21', gradle: '8.14.3'}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ matrix.gradle }}
+      - run: python scripts/setup_ci_maven.py
+      - run: pip install -r requirements.txt
+      - run: python -m unittest discover -s tests -p test_integration.py -v
+        env:
+          JAVA_UPDATE_INTEGRATION: '1'
+          JAVA_UPDATE_CASE: ${{ matrix.case }}
+          JAVA_UPDATE_ARTIFACTS: ${{ runner.temp }}/migration-evidence
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: evidence-${{ matrix.case }}
+          path: |
+            ${{ runner.temp }}/migration-evidence/**/evidence.tar.gz
+            ${{ runner.temp }}/migration-evidence/**/transcript.txt
+  boot:
+    needs: [fast, changes]
+    # Never execute fork content with secrets via pull_request_target.
+    if: needs.changes.outputs.native == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [boot35-maven, boot4-maven, boot35-gradle, boot4-gradle]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+      - run: python scripts/setup_ci_maven.py
+      - run: pip install -r requirements.txt
+      - run: python -m unittest discover -s tests -p test_integration.py -v
+        env:
+          JAVA_UPDATE_INTEGRATION: '1'
+          JAVA_UPDATE_CASE: ${{ matrix.case }}
+          JAVA_UPDATE_ARTIFACTS: ${{ runner.temp }}/migration-evidence
+          CODE_GENOME_USERNAME: ${{ secrets.CODE_GENOME_USERNAME }}
+          CODE_GENOME_TOKEN: ${{ secrets.CODE_GENOME_TOKEN }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: evidence-${{ matrix.case }}
+          path: |
+            ${{ runner.temp }}/migration-evidence/**/evidence.tar.gz
+            ${{ runner.temp }}/migration-evidence/**/transcript.txt
+  migration-gate:
+    needs: [fast, changes, native, boot]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          FAST: ${{ needs.fast.result }}
+          SCOPE: ${{ needs.changes.result }}
+          REQUIRED: ${{ needs.changes.outputs.native }}
+          NATIVE: ${{ needs.native.result }}
+          BOOT: ${{ needs.boot.result }}
+        run: |
+          python - <<'PY'
+          import os
+          assert os.environ['FAST'] == 'success' and os.environ['SCOPE'] == 'success', 'Fast checks/scope did not pass'
+          if os.environ['REQUIRED'] == 'true':
+              assert os.environ['NATIVE'] == 'success', 'Required real migration checks did not pass'
+              assert os.environ['BOOT'] == 'success', 'Required trusted Spring Boot checks did not pass; validate the reviewed commit on a trusted repository branch before merging/releasing'
+          PY

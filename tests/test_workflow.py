@@ -33,6 +33,8 @@ class FakeHost:
         self.directory, self.provider = directory, provider
         self.repos, self.calls = {}, []
         self.authentication_failed = False
+        self.review_requests = []
+        self.ambiguous_request = False
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -49,6 +51,10 @@ class FakeHost:
                 owner.calls.append(('GET', self.path))
                 if owner.authentication_failed:
                     return self.respond(401, {})
+                if '/pulls' in self.path or '/merge_requests' in self.path:
+                    import urllib.parse
+                    tail = urllib.parse.urlparse(self.path).path.rsplit('/', 1)[-1]
+                    return self.respond(200, owner.review_requests[int(tail) - 1] if tail.isdigit() else owner.review_requests)
                 if self.path in {'/user', '/users/acme'}:
                     return self.respond(200, {'login': 'acme', 'type': 'User'})
                 if self.path.startswith('/namespaces'):
@@ -59,6 +65,21 @@ class FakeHost:
             def do_POST(self):
                 data = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
                 owner.calls.append(('POST', self.path))
+                if self.path.endswith('/pulls') or self.path.endswith('/merge_requests'):
+                    branch = data.get('head') or data['source_branch']
+                    base = data.get('base') or data['target_branch']
+                    source = Path(owner.repos['source']['clone_url'])
+                    sha = git(source, 'rev-parse', branch)
+                    value = {'number': len(owner.review_requests) + 1, 'iid': len(owner.review_requests) + 1,
+                             'state': 'open' if owner.provider == 'github' else 'opened', 'draft': True,
+                             'head': {'ref': branch, 'sha': sha}, 'base': {'ref': base}, 'sha': sha,
+                             'source_branch': branch, 'target_branch': base, 'body': data.get('body'),
+                             'description': data.get('description'), 'html_url': 'https://host/request/1', 'web_url': 'https://host/request/1'}
+                    owner.review_requests.append(value)
+                    if owner.ambiguous_request:
+                        owner.ambiguous_request = False
+                        return self.respond(503, {})
+                    return self.respond(201, value)
                 name = data['name']
                 if name in owner.repos:
                     return self.respond(422, {})
@@ -151,11 +172,16 @@ class WorkflowTests(unittest.TestCase):
 
     def fake_build(self, argv, cwd, timeout=300):
         self.calls.append(argv)
+        if 'test' in argv or 'verify' in argv:
+            report = cwd / 'target/surefire-reports/TEST-regression.xml'
+            report.parent.mkdir(parents=True, exist_ok=True)
+            report.write_text('<testsuite tests="1" failures="0" errors="0" skipped="0"><testcase name="contract"/></testsuite>')
         if 'help:effective-pom' in argv:
             output = Path(next(arg.removeprefix('-Doutput=') for arg in argv if arg.startswith('-Doutput=')))
             pom = (cwd / 'pom.xml').read_text()
             # A resolved managed dependency appears with its effective version.
             pom = pom.replace('<artifactId>shared</artifactId></dependency>', '<artifactId>shared</artifactId><version>2.0.0</version></dependency>')
+            pom = pom.replace('<java.version>', '<maven.compiler.release>').replace('</java.version>', '</maven.compiler.release>')
             output.write_text(pom)
         if 'dependency:tree' in argv:
             destination = cwd / 'target/java-update-dependencies.tgf'
@@ -335,7 +361,7 @@ class WorkflowTests(unittest.TestCase):
         first = read_json(artifact_path(root, STAGES[5], 'repositories', 'api'))
         self.assertEqual('published', first['targets']['src_repo']['status'])
         self.assertEqual('failed', first['targets']['dst_repo']['status'])
-        self.assertTrue(git(self.source, 'rev-parse', 'automation/java-21'))
+        self.assertTrue(git(self.source, 'rev-parse', read_json(self.run_root() / 'run.json')['sources']['api']['migration_branch']))
         pushed.clear()
 
         def record(argv, cwd, timeout=300):
@@ -631,6 +657,10 @@ class WorkflowTests(unittest.TestCase):
             write_json(workspace / 'reports/summary.json', {'results': [{'status': 'changed'}]})
             return subprocess.CompletedProcess(argv, 0)
         def build(argv, cwd, timeout=300):
+            if 'test' in argv:
+                report = cwd / 'build/test-results/test/TEST-regression.xml'
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text('<testsuite tests="1"/>')
             if 'javaUpdateInventory' in argv:
                 init = Path(argv[argv.index('--init-script') + 1])
                 write_json(init.parent / 'effective-gradle.json', {'java_versions': ['21'], 'spring_boot_versions': [],
@@ -725,7 +755,7 @@ class WorkflowTests(unittest.TestCase):
         host = FakeHost(self.root, 'github')
         self.addCleanup(host.close)
         host.repos['source'] = {'clone_url': str(self.source)}
-        url = 'ssh://git@fake-host/acme/source.git'
+        url = 'ssh://git@127.0.0.1/acme/source.git'
         self.portfolio['repositories'][0]['source'] = url
         self.config['workflow']['publishing'] = {'enabled': True, 'targets': ['src_repo'], 'owner': 'acme',
             'source_default_branch': 'main', 'api_url': host.url, 'token_env': 'TEST_HOST_TOKEN'}
@@ -738,7 +768,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual('main', git(self.source, 'branch', '--show-current'))
         self.assertEqual(self.original, git(self.source, 'rev-parse', 'master'))
         self.assertEqual(self.original, git(self.source, 'rev-parse', 'main'))
-        self.assertNotEqual(self.original, git(self.source, 'rev-parse', 'automation/java-21'))
+        self.assertNotEqual(self.original, git(self.source, 'rev-parse', read_json(self.run_root() / 'run.json')['sources']['api']['migration_branch']))
 
     def test_stage_five_and_six_markdown_show_validation_and_target_results(self):
         with self.external_tools():
