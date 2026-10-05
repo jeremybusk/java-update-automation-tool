@@ -106,6 +106,41 @@ Validation scope can use `workflow.validation.build_roots` and explicit
 `exclusions` with reasons, as described in [the workflow guide](../notes/workflow.md);
 those validation settings do not narrow stage 04 migration.
 
+## Optional Java upgrade skills
+
+These skills can help an agent assess a migration, review its output, or develop
+additional recipes. The links below document optional tools; `portfolio.py` does
+not install or invoke them. Choose the skill for the specific task to keep
+suggestions focused.
+
+| Skill | Useful scope | Fit in this workflow |
+| --- | --- | --- |
+| [darshitpp/java-code-upgrade](https://github.com/darshitpp/java-code-upgrade/blob/main/SKILL.md) | Before/after Java idiom examples, filtered by target JDK, including collections, streams, concurrency, and enterprise patterns. | Optional review after stage 04 or ideas for custom recipe tests. Routine cleanup overlaps with the existing recipe packs. |
+| [G10xy/java-version-upgrade-skill](https://github.com/G10xy/java-version-upgrade-skill/blob/main/SKILL.md) | Java LTS migration checklists, removed/internal APIs, compiler versus runtime versions, JVM flags, dependencies, and behavior changes. | Compatibility review during stages 01–03 and additional test ideas for stage 05. It explicitly excludes Spring Boot version upgrades. |
+| [Moderne create-recipe](https://docs.moderne.io/user-documentation/agent-tools/skills/#create-recipe) | Official guidance for declarative, Refaster, and imperative OpenRewrite recipes, with RewriteTest coverage and real-code validation. | Recipe development alongside `rewrite-recipe-starter`; add the resulting reviewed recipe/artifact to the configured migration. Requires Moderne CLI 4.5.3 or later. |
+
+Keep `java-update.yml` authoritative for target versions and pinned artifacts.
+Verify community examples and dependency compatibility claims against current
+JDK, build-tool, framework, and OpenRewrite documentation. Accepted agent edits
+need review and fresh stage 05 validation before publication; optional style or
+architecture changes are best reviewed as separate follow-up work.
+
+For a focused review, ask the agent using the chosen skill:
+
+```text
+Review the migrated checkout against the approved Java target in java-update.yml.
+Identify remaining compatibility blockers and behavior changes that need tests.
+For each finding, give its file location, reason, and suggested validation.
+Use the configured targets and stable Java APIs; report optional modernization
+opportunities separately from required compatibility fixes.
+```
+
+Moderne also supplies `prethink` for reading generated `.moderne/context/`
+architecture and dependency information. It is useful when that context already
+exists. Its additional tool-routing skills require the experimental local MCP
+server; see [the official skill prerequisites](https://docs.moderne.io/user-documentation/agent-tools/skills/)
+before adopting those integrations.
+
 ## Recipe development and CI references
 
 | Reference | Use |
