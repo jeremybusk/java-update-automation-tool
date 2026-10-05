@@ -48,6 +48,7 @@ CODE_GENOME_VERSIONS = {
 TARGETS = (11, 17, 21, 25)
 CODE_GENOME_URL = "https://artifacts.codegenomeproject.org/maven"
 PRINT_LOCK = threading.Lock()
+MAVEN_SETTINGS_XML_LOCK = threading.Lock()
 DEFAULT_EXCLUSIONS = (
     "**/generated/**",
     "**/generated-sources/**",
@@ -984,6 +985,17 @@ def xml_add(parent: ET.Element, name: str, text: str) -> ET.Element:
     return node
 
 
+def write_maven_settings_xml(path: Path, root: ET.Element) -> None:
+    """Write the unprefixed settings elements expected by Maven's XML reader."""
+    # ElementTree's namespace registry is global; keep registration and writing
+    # together so parallel migrations cannot change each other's default prefix.
+    with MAVEN_SETTINGS_XML_LOCK:
+        if root.tag.startswith("{"):
+            ET.register_namespace("", root.tag[1:].split("}", 1)[0])
+        ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
+    path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+
+
 def write_maven_settings(path: Path, args: argparse.Namespace, env: dict[str, str]) -> None:
     source = args.maven_settings or Path.home() / ".m2" / "settings.xml"
     remote = remote_recipe_repository(args)
@@ -994,8 +1006,7 @@ def write_maven_settings(path: Path, args: argparse.Namespace, env: dict[str, st
                 name = f"JAVA_UPDATE_MAVEN_SECRET_{index}"
                 env[name] = node.text
                 node.text = "${env." + name + "}"
-        ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
-        path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        write_maven_settings_xml(path, root)
         return
     try:
         root = ET.parse(source).getroot() if source.is_file() else ET.Element("settings")
@@ -1030,8 +1041,7 @@ def write_maven_settings(path: Path, args: argparse.Namespace, env: dict[str, st
             name = f"JAVA_UPDATE_MAVEN_SECRET_{index}"
             env[name] = node.text
             node.text = "${env." + name + "}"
-    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
-    path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    write_maven_settings_xml(path, root)
 
 
 def executable(build: BuildRoot) -> str:

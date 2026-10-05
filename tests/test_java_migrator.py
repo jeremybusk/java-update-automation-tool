@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import java_migrator as jm
@@ -73,6 +74,51 @@ class MigratorTests(unittest.TestCase):
                 self.assertIn('private-secret-value', env.values())
                 self.assertIn('${env.', retained)
                 self.assertEqual(0o600, destination.stat().st_mode & 0o777)
+
+    def test_namespaced_maven_settings_preserve_default_namespace_and_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, destination = root / 'user-settings.xml', root / 'retained-settings.xml'
+            xsi = 'http://www.w3.org/2001/XMLSchema-instance'
+            for version in ('1.0.0', '1.1.0'):
+                namespace = f'http://maven.apache.org/SETTINGS/{version}'
+                schema = f'{namespace} https://maven.apache.org/xsd/settings-{version}.xsd'
+                source.write_text(
+                    f'<settings xmlns="{namespace}" xmlns:xsi="{xsi}" xsi:schemaLocation="{schema}">'
+                    '<servers><server><id>private</id><username>private-user</username>'
+                    '<password>private-secret-value</password></server></servers>'
+                    '<mirrors><mirror><id>internal</id><mirrorOf>central</mirrorOf>'
+                    '<url>https://example.com/maven</url></mirror></mirrors></settings>'
+                )
+                for repository in ('maven-central', 'codegenome'):
+                    with self.subTest(version=version, repository=repository):
+                        args = jm.parse_args(['example', '--maven-settings', str(source), '--recipe-repository', repository])
+                        env = {'CODE_GENOME_USERNAME': 'recipe-user', 'CODE_GENOME_TOKEN': 'recipe-secret-value'}
+                        jm.write_maven_settings(destination, args, env)
+                        retained = destination.read_text()
+                        self.assertTrue(retained.split('?>', 1)[1].lstrip().startswith('<settings '), retained)
+                        parsed = ET.fromstring(retained)
+                        ns = {'s': namespace}
+                        self.assertEqual(f'{{{namespace}}}settings', parsed.tag)
+                        self.assertEqual(schema, parsed.get(f'{{{xsi}}}schemaLocation'))
+                        self.assertEqual('central', parsed.findtext('s:mirrors/s:mirror/s:mirrorOf', namespaces=ns))
+                        self.assertEqual('https://example.com/maven', parsed.findtext('s:mirrors/s:mirror/s:url', namespaces=ns))
+                        for secret in ('private-user', 'private-secret-value', 'recipe-secret-value'):
+                            self.assertNotIn(secret, retained)
+                        self.assertIn('private-secret-value', env.values())
+                        self.assertEqual(0o600, destination.stat().st_mode & 0o777)
+                        if repository == 'codegenome':
+                            profile = parsed.find("s:profiles/s:profile[s:id='java-migrator-recipes']", ns)
+                            self.assertIsNotNone(profile)
+                            for collection, item in (('repositories', 'repository'), ('pluginRepositories', 'pluginRepository')):
+                                self.assertEqual(jm.CODE_GENOME_URL, profile.findtext(f's:{collection}/s:{item}/s:url', namespaces=ns))
+                            self.assertEqual('java-migrator-recipes', parsed.findtext('s:activeProfiles/s:activeProfile', namespaces=ns))
+                            server = parsed.find("s:servers/s:server[s:id='codegenome']", ns)
+                            self.assertIsNotNone(server)
+                            self.assertEqual('${env.CODE_GENOME_USERNAME}', server.findtext('s:username', namespaces=ns))
+                            self.assertEqual('${env.CODE_GENOME_TOKEN}', server.findtext('s:password', namespaces=ns))
+                        else:
+                            self.assertNotIn(jm.CODE_GENOME_URL, retained)
 
     def test_generated_recipe_contains_phase_recipes(self):
         with tempfile.TemporaryDirectory() as directory:
