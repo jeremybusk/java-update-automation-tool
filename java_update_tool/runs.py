@@ -129,10 +129,14 @@ def source_commit(repo: Repository) -> str:
         return git(source, "rev-parse", "--verify", f"{revision}^{{commit}}")
     if len(revision) == 40 and all(char in "0123456789abcdefABCDEF" for char in revision):
         return revision.lower()
-    lines = command(["git", "ls-remote", repo.source, revision, f"refs/heads/{revision}",
-                     f"refs/tags/{revision}", f"refs/tags/{revision}^{{}}"], Path.cwd()).splitlines()
-    matches = [line.split()[0] for line in lines if line.endswith("^{}")]
-    matches = matches or [line.split()[0] for line in lines]
+    requested_refs = {revision, f"refs/heads/{revision}", f"refs/tags/{revision}",
+                      f"refs/tags/{revision}^{{}}", f"{revision}^{{}}"}
+    lines = command(["git", "ls-remote", repo.source, *sorted(requested_refs)], Path.cwd()).splitlines()
+    # ls-remote patterns also match ref suffixes, including stale tracking refs.
+    resolved = [(sha, ref) for sha, ref in (line.split() for line in lines)
+                if ref in requested_refs]
+    matches = [sha for sha, ref in resolved if ref.endswith("^{}")]
+    matches = matches or [sha for sha, ref in resolved]
     if not matches or len(set(matches)) != 1:
         raise PortfolioError(f"source ref cannot be resolved unambiguously: {repo.key}")
     return matches[0]
