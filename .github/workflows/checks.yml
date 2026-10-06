@@ -97,14 +97,16 @@ jobs:
     if: needs.changes.outputs.native == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    env:
-      # A repository variable can point persistent runners at a private cache volume.
-      JAVA_UPDATE_RECIPE_CACHE: ${{ vars.JAVA_UPDATE_RECIPE_CACHE || format('{0}/recipe-cache', runner.temp) }}
     strategy:
       fail-fast: false
       matrix:
         case: [boot35-maven, boot4-maven, boot35-gradle, boot4-gradle]
     steps:
+      - name: Configure recipe cache
+        env:
+          # Runner context is available in step env, but not job env.
+          JAVA_UPDATE_RECIPE_CACHE: ${{ vars.JAVA_UPDATE_RECIPE_CACHE || format('{0}/recipe-cache', runner.temp) }}
+        run: printf '%s\n' "JAVA_UPDATE_RECIPE_CACHE=$JAVA_UPDATE_RECIPE_CACHE" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
