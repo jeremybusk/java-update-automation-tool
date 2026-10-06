@@ -76,7 +76,7 @@ def planning_policy(config: dict[str, Any], discoveries: list[dict[str, Any]], o
     rewrite = result["migration"]["openrewrite"]
     if rewrite.get("artifacts"):
         import java_migrator as engine
-        versions = engine.CODE_GENOME_VERSIONS if rewrite.get("recipe_repository") == "codegenome" else engine.MAVEN_CENTRAL_VERSIONS
+        versions = engine.CODE_GENOME_VERSIONS if rewrite.get("recipe_repository") in {"codegenome", "source", "auto"} else engine.MAVEN_CENTRAL_VERSIONS
         for artifact, key in (("rewrite-migrate-java", "migrate_java"), ("rewrite-static-analysis", "static_analysis"),
                               ("rewrite-java-dependencies", "java_dependencies"), ("rewrite-testing-frameworks", "testing_frameworks")):
             if not any(item.startswith(f"org.openrewrite.recipe:{artifact}:") for item in rewrite["artifacts"]):

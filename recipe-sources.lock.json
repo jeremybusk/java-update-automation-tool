@@ -1,0 +1,260 @@
+{
+  "schema_version": 1,
+  "java": 21,
+  "rewrite_version": "8.92.17",
+  "build_plugin_version": "2.24.2",
+  "gradle_plugin_artifact": "org.openrewrite:plugin:7.41.0",
+  "dependency_versions": {
+    "tech.picnic.error-prone-support:error-prone-contrib": "0.30.0",
+    "org.openrewrite:rewrite-java": "8.92.17",
+    "org.openrewrite.recipe:rewrite-java-dependencies": "1.63.0",
+    "org.openrewrite.recipe:rewrite-logging-frameworks": "3.34.0",
+    "org.openrewrite.recipe:rewrite-static-analysis": "2.44.0",
+    "org.openrewrite:rewrite-templating": "1.45.2",
+    "org.openrewrite:rewrite-yaml": "8.92.17",
+    "org.openrewrite.recipe:rewrite-migrate-java": "3.45.0",
+    "org.openrewrite:rewrite-properties": "8.92.17",
+    "org.openrewrite:rewrite-maven": "8.92.17",
+    "org.openrewrite:rewrite-gradle": "8.92.17",
+    "org.openrewrite:rewrite-groovy": "8.92.17",
+    "org.openrewrite:rewrite-java-21": "8.92.17",
+    "org.openrewrite:rewrite-xml": "8.92.17",
+    "org.openrewrite:rewrite-kotlin": "8.92.17",
+    "org.openrewrite:rewrite-json": "8.92.17",
+    "org.openrewrite:rewrite-docker": "8.92.17",
+    "org.openrewrite.recipe:rewrite-github-actions": "3.32.0",
+    "org.openrewrite.recipe:rewrite-joda": "0.11.1",
+    "org.openrewrite.recipe:rewrite-jenkins": "0.38.1",
+    "org.openrewrite:rewrite-java-8": "8.92.17",
+    "org.openrewrite:rewrite-java-11": "8.92.17",
+    "org.openrewrite:rewrite-java-17": "8.92.17",
+    "org.openrewrite:rewrite-java-25": "8.92.17",
+    "org.openrewrite.gradle.tooling:model": "8.92.17",
+    "org.openrewrite.recipe:rewrite-apache": "2.33.0",
+    "org.openrewrite.recipe:rewrite-hibernate": "2.26.1",
+    "org.openrewrite.recipe:rewrite-jackson": "1.30.1",
+    "org.openrewrite.recipe:rewrite-micrometer": "0.31.1",
+    "org.openrewrite.recipe:rewrite-openapi": "0.34.1",
+    "org.openrewrite.recipe:rewrite-testing-frameworks": "3.47.0",
+    "org.openrewrite.meta:rewrite-analysis": "2.38.1",
+    "org.openrewrite:rewrite-polyglot": "2.12.1",
+    "org.openrewrite:rewrite-javascript": "8.92.17",
+    "org.openrewrite:rewrite-csharp": "8.92.17",
+    "org.openrewrite:rewrite-python": "8.92.17",
+    "org.openrewrite:rewrite-go": "8.92.17"
+  },
+  "modules": [
+    {
+      "artifact": "org.openrewrite:plugin:7.41.0",
+      "repository": "https://github.com/openrewrite/rewrite-gradle-plugin",
+      "commit": "83b577cadd92872aa3e66257be13bb21ebe657f8",
+      "projects": ["plugin"],
+      "publish_task": ":plugin:publishToMavenLocal",
+      "build_patches": [{
+        "file": "build.gradle.kts",
+        "find": "configure<nebula.plugin.release.git.base.ReleasePluginExtension> {\n    defaultVersionStrategy = nebula.plugin.release.NetflixOssStrategies.SNAPSHOT(project)\n}\n",
+        "replace": ""
+      }],
+      "depends_on": []
+    },
+    {
+      "artifact": "org.openrewrite.recipe:rewrite-apache:2.33.0",
+      "repository": "https://github.com/openrewrite/rewrite-apache",
+      "commit": "f8e2e2e8621b6c4e4a17c2e1bb6e657f4a44e15a",
+      "depends_on": [
+        "rewrite-java-dependencies",
+        "rewrite-logging-frameworks",
+        "rewrite-static-analysis"
+      ]
+    },
+    {
+      "artifact": "org.openrewrite.recipe:rewrite-github-actions:3.32.0",
+      "repository": "https://github.com/openrewrite/rewrite-github-actions",
+      "commit": "ce30394e8daa5ecbb3cb7f557768882278ea5a57",
+      "depends_on": []
+    },
+    {
+      "artifact": "org.openrewrite.recipe:rewrite-hibernate:2.26.1",
+      "repository": "https://github.com/openrewrite/rewrite-hibernate",
+      "commit": "c7af65bf3547a7fa2e0608da5f374bf0b70f0f51",
+      "depends_on": [
+        "rewrite-migrate-java",
+        "rewrite-java-dependencies"
+      ]
+    },
+    {
+      "artifact": "org.openrewrite.recipe:rewrite-jackson:1.30.1",
+      "repository": "https://github.com/openrewrite/rewrite-jackson",
+      "commit": "5b7e4f369f7a96a33917e66e84919e56d54bd6a9",
+      "depends_on": [
+        "rewrite-java-dependencies"
+      ]
+    },
+    {
+      "artifact": "org.openrewrite.recipe:rewrite-java-dependencies:1.63.0",
+      "repository": "https://github.com/openrewrite/rewrite-java-dependencies",
+      "commit": "e8e28df108c90a6dd19aacd975c54ac9447bef88",
+      "depends_on": []
+    },
+    {
+      "artifact": "org.openrewrite.recipe:rewrite-jenkins:0.38.1",
+      "repository": "https://github.com/openrewrite/rewrite-jenkins",
+      "commit": "d27bd2d50d14f874221ebc2a3e92f887f14a2c38",
+      "depends_on": [
+        "rewrite-java-dependencies"
+      ]
+    },
+    {
+      "artifact": "org.openrewrite.recipe:rewrite-joda:0.11.1",
+      "repository": "https://github.com/openrewrite/rewrite-joda",
+      "commit": "d50604123afc40b43754e946ee7ed03867879893",
+      "license_source": "https://raw.githubusercontent.com/openrewrite/rewrite/94c2aaf5f690a7f7367db848d0869a50623993e8/rewrite-javascript/LICENSE.md",
+      "license_sha256": "1d8fc6fc111af1a988203c03956c92bf0b3f62822018e3e0321e8129d777d14a",
+      "depends_on": [
+        "rewrite-java-dependencies"
+      ]
+    },
+    {
+      "artifact": "org.openrewrite.recipe:rewrite-logging-frameworks:3.34.0",
+      "repository": "https://github.com/openrewrite/rewrite-logging-frameworks",
+      "commit": "d562446fe083643ddb69b8a6a1f40635ca721555",
+      "depends_on": [
+        "rewrite-java-dependencies",
+        "rewrite-static-analysis"
+      ]
+    },
+    {
+      "artifact": "org.openrewrite.recipe:rewrite-micrometer:0.31.1",
+      "repository": "https://github.com/openrewrite/rewrite-micrometer",
+      "commit": "1682846f7f0b517079078d2ff41d882b19f7ca79",
+      "depends_on": [
+        "rewrite-java-dependencies"
+      ]
+    },
+    {
+      "artifact": "org.openrewrite.recipe:rewrite-migrate-java:3.45.0",
+      "repository": "https://github.com/openrewrite/rewrite-migrate-java",
+      "commit": "f398db379f005259cc20eba1dad0c70c9a1625c7",
+      "build_dependencies": ["io.micrometer:micrometer-core:1.17.1"],
+      "depends_on": [
+        "rewrite-github-actions",
+        "rewrite-java-dependencies",
+        "rewrite-static-analysis",
+        "rewrite-joda",
+        "rewrite-jenkins"
+      ]
+    },
+    {
+      "artifact": "org.openrewrite.recipe:rewrite-openapi:0.34.1",
+      "repository": "https://github.com/openrewrite/rewrite-openapi",
+      "commit": "66346df7fa95475293d849a111003add117e71ad",
+      "depends_on": [
+        "rewrite-java-dependencies"
+      ]
+    },
+    {
+      "artifact": "org.openrewrite.recipe:rewrite-spring:6.40.0",
+      "repository": "https://github.com/openrewrite/rewrite-spring",
+      "commit": "b10e0f7c87c4ef9adfe9db4e26460bbf870615dd",
+      "depends_on": [
+        "rewrite-java-dependencies",
+        "rewrite-static-analysis",
+        "rewrite-apache",
+        "rewrite-hibernate",
+        "rewrite-jackson",
+        "rewrite-micrometer",
+        "rewrite-migrate-java",
+        "rewrite-openapi",
+        "rewrite-testing-frameworks"
+      ]
+    },
+    {
+      "artifact": "org.openrewrite.recipe:rewrite-static-analysis:2.44.0",
+      "repository": "https://github.com/openrewrite/rewrite-static-analysis",
+      "commit": "424b8d94fe8ea3309fb236583096cabf980f5038",
+      "depends_on": [
+        "rewrite-javascript",
+        "rewrite-csharp",
+        "rewrite-python",
+        "rewrite-go"
+      ]
+    },
+    {
+      "artifact": "org.openrewrite.recipe:rewrite-testing-frameworks:3.47.0",
+      "repository": "https://github.com/openrewrite/rewrite-testing-frameworks",
+      "commit": "a389d725168173b3036b53cd5b9a9d62d22e4182",
+      "depends_on": [
+        "rewrite-java-dependencies",
+        "rewrite-static-analysis"
+      ]
+    },
+    {
+      "artifact": "org.openrewrite:rewrite-javascript:8.92.17",
+      "repository": "https://github.com/openrewrite/rewrite",
+      "commit": "94c2aaf5f690a7f7367db848d0869a50623993e8",
+      "subdirectory": "rewrite-javascript",
+      "java_api_only": true,
+      "compile_dependencies": [
+        "org.openrewrite:rewrite-core:8.92.17",
+        "org.openrewrite:rewrite-java:8.92.17",
+        "org.openrewrite:rewrite-json:8.92.17",
+        "org.jetbrains:annotations:26.1.0",
+        "com.fasterxml.jackson.core:jackson-annotations:2.21",
+        "org.openrewrite:rewrite-yaml:8.92.17",
+        "org.yaml:snakeyaml:2.7",
+        "io.moderne:jsonrpc:1.3.0"
+      ],
+      "depends_on": []
+    },
+    {
+      "artifact": "org.openrewrite:rewrite-csharp:8.92.17",
+      "repository": "https://github.com/openrewrite/rewrite",
+      "commit": "94c2aaf5f690a7f7367db848d0869a50623993e8",
+      "subdirectory": "rewrite-csharp",
+      "java_api_only": true,
+      "compile_dependencies": [
+        "org.openrewrite:rewrite-core:8.92.17",
+        "org.openrewrite:rewrite-java:8.92.17",
+        "org.jetbrains:annotations:26.1.0",
+        "com.fasterxml.jackson.core:jackson-annotations:2.21",
+        "io.moderne:jsonrpc:1.3.0",
+        "org.openrewrite:rewrite-xml:8.92.17"
+      ],
+      "depends_on": []
+    },
+    {
+      "artifact": "org.openrewrite:rewrite-python:8.92.17",
+      "repository": "https://github.com/openrewrite/rewrite",
+      "commit": "94c2aaf5f690a7f7367db848d0869a50623993e8",
+      "subdirectory": "rewrite-python",
+      "java_api_only": true,
+      "compile_dependencies": [
+        "org.openrewrite:rewrite-core:8.92.17",
+        "org.openrewrite:rewrite-java:8.92.17",
+        "org.openrewrite:rewrite-toml:8.92.17",
+        "org.jetbrains:annotations:26.1.0",
+        "com.fasterxml.jackson.core:jackson-annotations:2.21",
+        "org.openrewrite:rewrite-json:8.92.17",
+        "io.moderne:jsonrpc:1.3.0",
+        "org.openrewrite:rewrite-maven:8.92.17"
+      ],
+      "depends_on": []
+    },
+    {
+      "artifact": "org.openrewrite:rewrite-go:8.92.17",
+      "repository": "https://github.com/openrewrite/rewrite",
+      "commit": "94c2aaf5f690a7f7367db848d0869a50623993e8",
+      "subdirectory": "rewrite-go",
+      "java_api_only": true,
+      "compile_dependencies": [
+        "org.openrewrite:rewrite-core:8.92.17",
+        "org.openrewrite:rewrite-java:8.92.17",
+        "org.jetbrains:annotations:26.1.0",
+        "com.fasterxml.jackson.core:jackson-annotations:2.21",
+        "io.moderne:jsonrpc:1.3.0"
+      ],
+      "depends_on": []
+    }
+  ],
+  "lombok_version": "1.18.48"
+}

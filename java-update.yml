@@ -39,10 +39,18 @@ migration:
     strict: false
     commands: []
   openrewrite:
-    # This recipe repository needs CODE_GENOME_USERNAME/CODE_GENOME_TOKEN.
-    # Recipes are derived from targets; leave this empty unless adding overrides.
-    # For Java-only migrations, clear artifacts and use maven-central.
-    recipe_repository: codegenome
+    # Build current recipe sources once, then reuse the private local cache.
+    # Other modes: auto (binary first, source fallback), maven-central, codegenome, maven-local.
+    # A Maven-compatible Nexus group/hosted URL can override the remote below.
+    # Recipes are derived from targets; leave recipes empty unless adding overrides.
+    # Newer Code Genome MSAL recipe JARs require customer download entitlement.
+    recipe_repository: source
+    source_cache: ~/.cache/java-update/recipes
+    source_lock: recipe-sources.lock.json
+    # null selects the mode's upstream; e.g. https://nexus.example/repository/maven-group/
+    artifact_repository: null
+    repository_username_env: CODE_GENOME_USERNAME
+    repository_token_env: CODE_GENOME_TOKEN
     recipes: []
     artifacts:
       - org.openrewrite.recipe:rewrite-migrate-java:3.45.0

@@ -73,6 +73,128 @@ Supported built-in targets are Java 11/17/21/25 and Spring Boot 3.5/4.0 lines. S
 
 Pins under `alignment.dependencies.pins` use `group:artifact` or glob patterns. Exact keys take precedence. Conflicting matching glob values fail regardless of YAML order. Pins are checked against resolved dependencies even when only one repository contains them or all repositories agree on an incorrect version. Lower declared pins require `workflow.allow_downgrades: true`. This permits planning a downgrade; upgrade recipes may still require an explicit stack/property/custom recipe to achieve it. Unmet pins always fail validation. Managed/BOM upgrades are preferred over arbitrary managed-version overrides.
 
+## Recipe sources and source builds
+
+`migration.openrewrite` in `java-update.yml` is the global configuration for
+recipe sources, remote Maven repositories, and the local source cache. The
+checked-in default builds current recipe sources instead of downloading
+customer-only MSAL JARs:
+
+```yaml
+migration:
+  openrewrite:
+    recipe_repository: source
+    source_cache: ~/.cache/java-update/recipes
+    source_lock: recipe-sources.lock.json
+    artifact_repository: null
+    repository_username_env: CODE_GENOME_USERNAME
+    repository_token_env: CODE_GENOME_TOKEN
+```
+
+| Mode | Recipe artifacts | Remote repository when URL is null |
+| --- | --- | --- |
+| `source` | Build pinned GitHub source commits; reuse verified local JARs | Code Genome for Apache core/build dependencies |
+| `auto` | Resolve binaries first; source fallback when recipe downloads fail | Maven Central for recipe probing; Code Genome for Apache build/core dependencies |
+| `codegenome` | Download pinned current binaries | Code Genome; MSAL JARs need customer entitlement |
+| `maven-central` | Download versions available on Central | Maven Central |
+| `maven-local` | Use recipes already installed in Maven local | Maven Central for remaining dependencies |
+
+Set `artifact_repository` to a Maven-compatible Nexus 3 group/hosted repository
+URL to use your own server in `source`, `auto`, `codegenome`, or `maven-central` mode.
+Configure credential **environment-variable names**, not values:
+
+```yaml
+artifact_repository: https://nexus.example/repository/maven-group/
+repository_username_env: NEXUS_USERNAME
+repository_token_env: NEXUS_PASSWORD
+```
+
+`source` and `auto` also build the pinned upstream Gradle plugin compatibility
+fix against the same core. The published plugin predates a core marker API
+change; using its old binary with current packs fails with `NoSuchMethodError`.
+This source plugin stays in the private cache and is loaded before remotes.
+
+`auto` checks the locked recipe dependency set before running any recipes. A
+missing or denied POM/JAR triggers a source build, which is cached for reuse.
+Recipe execution errors and failed application tests do not trigger fallback.
+Map the chosen credential variables into your runner environment (or the
+workflow's `env` section); an anonymous Nexus endpoint can leave them unset.
+
+In source mode that endpoint must supply the Apache OpenRewrite build/core
+artifacts. In binary mode it must also contain the requested recipe JARs and
+POMs. A proxy cannot grant access to an upstream JAR that returns 403. A hosted
+repository can hold internally built artifacts. Selecting Maven Central also
+requires changing the artifact pins to versions it hosts; verified public pins
+include spring `6.37.1`, migrate-java `3.42.1`, static-analysis `2.41.1`,
+java-dependencies `1.60.2`, and testing-frameworks `3.44.0`. They include Boot
+3.5/4.0 recipes, but are older than the current source pins.
+
+A free Code Genome token is sufficient for source builds' Apache dependencies.
+It does not grant access to prebuilt MSAL recipe JARs. See
+[Code Genome's access requirements](https://docs.moderne.io/user-documentation/recipes/accessing-the-code-genome-project/).
+
+Source builds run automatically before migration; report-only/dry runs do not
+build recipes. To warm the cache explicitly with credentials from your local
+`.env` (the file is parsed, never executed):
+
+```bash
+python3 -B scripts/build_recipe_sources.py --env-file ~/.env
+```
+
+The recipe compiler needs JDK 21, Python 3.12+, and access to GitHub, Gradle
+Plugin Portal, Maven Central, and the configured Maven endpoint. Upstream Gradle
+wrappers download the build Gradle version. For a Java 25 migration, retain JDK
+25 on PATH and set `JAVA_UPDATE_SOURCE_JAVA_HOME` to a JDK 21 installation for
+recipe compilation. Gradle plugin compilation also resolves its Android compile
+API from Google's Maven repository. The warm-cache command accepts `--java-home PATH` and
+`--cache PATH`. `JAVA_UPDATE_RECIPE_CACHE` overrides the configured cache path.
+A Linux container with JDK 21 can serve the same purpose; mount a private
+persistent cache volume rather than rebuilding an image for every migration.
+
+`recipe-sources.lock.json` pins source commits, recipe dependency versions,
+core version, and the build-plugin version. Update it together with recipe pins.
+The set includes fourteen recipe packs and four Java-facing language APIs
+needed by static analysis's compile-only checks, plus the compatible Gradle
+plugin. Those APIs use their current
+Java sources; native JavaScript/C#/Python/Go RPC backends are not packaged or
+used by this Java migration runner.
+The builder builds recipe dependencies first, adapts upstream settings to avoid
+remote build caches/scans, disables release signing, and publishes the exact
+locked coordinates into an isolated Maven repository. It retains license and
+source-build modification notices in JARs; the older Joda commit's missing full
+agreement is supplied from a pinned, checksum-verified upstream license copy.
+Upstream recipe unit tests are not
+run during packaging; the integration matrix validates the resulting migrations
+and their application tests. Cache receipts hash the installed files; missing
+or altered files rebuild their recipe. The cache key includes the lock file,
+builder code, compiler JDK identity, and remote repository URL. Build logs are
+kept inside the cache.
+
+The four Boot matrix checks run in parallel on separate hosted runners, each
+with its own source cache. Multiple warm-cache commands using the same cache
+serialize behind a build lock. For planning, allow 15–30+ minutes for cold recipe
+preparation, plus migration and application tests; this estimate has not been
+measured on a fresh GitHub Actions runner.
+
+To reduce repeated preparation, retain a private cache on a persistent runner
+or mounted volume. When adapting the workflow to a persistent runner, set the
+repository variable `JAVA_UPDATE_RECIPE_CACHE` to that volume's cache path.
+Alternatively, populate an authenticated internal Nexus
+repository with source-built recipes, then select `auto` and its
+`artifact_repository` URL to reuse those binaries. Subagents can investigate
+failures and review tests while builds run; compilation still follows the
+recipe dependency order.
+
+MSAL permits internal use subject to its limitations and notice requirements;
+see the [license terms](https://docs.moderne.io/licensing/moderne-source-available-license/).
+Keep compiled MSAL recipes in a private runner cache or authenticated internal
+hosted repository. Public CI uploads redacted source-build logs, while compiled
+recipes stay out of Actions artifacts and Gradle caches. Hosted runners rebuild
+on a fresh job; persistent internal runners
+or a private cache volume retain builds across runs. Docker changes the build
+environment, not artifact entitlement or distribution terms. See also the
+[upstream source-build instructions](https://docs.openrewrite.org/reference/building-openrewrite-from-source).
+
 ## Validation contract
 
 Stage 05 operates on migrated, committed source. It runs every discovered build root, obtains effective versions, checks every applicable pin and target, and creates fresh application/group alignment assessments. Missing or unresolved required versions fail. Report-only execution remains analyzed/prepared and cannot enter validation.
@@ -285,14 +407,15 @@ from these checked-in workflows.
 
 CI uses Maven 3.9.11, Gradle 8.14.3 with JDK 21 for Java-21/Boot cases, and Gradle
 9.1.0 with JDK 25 for Java-25 cases. Recipe versions are pinned in the migration
-defaults; Boot uses `rewrite-spring:6.40.0`. Each run records actual tool versions.
+defaults; Boot uses `rewrite-spring:6.40.0` built from its locked source commit. Each run records actual tool versions.
 These fixtures establish this matrix, rather than universal tool/version support.
 
-Spring Boot cases require repository secrets `CODE_GENOME_USERNAME` and
-`CODE_GENOME_TOKEN` on trusted jobs. Fork PRs run credential-free checks; maintainers
-validate a reviewed identical commit on a trusted repository branch before merging.
-The gate fails when required trusted checks are skipped or prerequisites are absent.
-The workflow never uses `pull_request_target` to run fork content with secrets.
+Boot cases use the global recipe configuration. With source defaults, trusted
+jobs need `CODE_GENOME_USERNAME` and `CODE_GENOME_TOKEN` secrets for Apache
+build dependencies. Java-only baseline cases use Maven Central and run on fork
+PRs. Maintainers validate fork changes on a trusted repository branch before
+merging; required skipped or failed checks fail the gate. The workflow never
+uses `pull_request_target` to execute fork content with secrets.
 
 Run a selected native case locally with JDK and build tools available:
 

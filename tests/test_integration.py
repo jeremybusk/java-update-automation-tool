@@ -32,8 +32,6 @@ class RealMigrationTests(unittest.TestCase):
             source.mkdir()
             tool, target, config = create(case, source)
             self.assertTrue(shutil.which('java') and shutil.which('mvn' if tool == 'maven' else 'gradle'), f'JDK and {tool} must be installed')
-            if case.startswith('boot'):
-                self.assertTrue(os.environ.get('CODE_GENOME_USERNAME') and os.environ.get('CODE_GENOME_TOKEN'), 'trusted Boot checks require CODE_GENOME_USERNAME and CODE_GENOME_TOKEN')
             git(source, 'init', '-b', 'master')
             git(source, 'add', '--all')
             git(source, 'commit', '-m', 'Original migration fixture')

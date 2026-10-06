@@ -76,6 +76,8 @@ def _migration_policy(config: dict[str, Any]) -> dict[str, Any]:
         "targetJava": int(config["targets"]["java"]["desired"]),
         "buildTool": config.get("discovery", {}).get("build_tool", "auto"),
         "recipes": rewrite.get("recipes", []), "artifacts": rewrite.get("artifacts", []),
+        "openrewrite": {key: rewrite[key] for key in ("artifact_repository", "repository_username_env",
+                        "repository_token_env", "source_cache", "source_lock") if key in rewrite},
         "dependencies": {"pin": {
             pattern: str(version)
             for pattern, version in config.get("alignment", {}).get("dependencies", {}).get("pins", {}).items()

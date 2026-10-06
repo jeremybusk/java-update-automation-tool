@@ -44,7 +44,7 @@ jobs:
           required = os.environ['CI_EVENT'] in {'workflow_dispatch', 'release'} or os.environ['CI_REF'].startswith('refs/tags/') or not base or set(base) == {'0'}
           if not required:
               changed = subprocess.check_output(['git', 'diff', '--name-only', base, 'HEAD'], text=True).splitlines()
-              required = any(path.startswith(('java_update_tool/', 'tests/', '.github/', 'scripts/')) or path in {'java_migrator.py','portfolio.py','java-update.yml','requirements.txt'} for path in changed)
+              required = any(path.startswith(('java_update_tool/', 'tests/', '.github/', 'scripts/')) or path in {'java_migrator.py','portfolio.py','java-update.yml','recipe-sources.lock.json','requirements.txt'} for path in changed)
           with open(os.environ['GITHUB_OUTPUT'], 'a') as handle:
               handle.write('native=' + str(required).lower() + '\n')
           PY
@@ -93,10 +93,13 @@ jobs:
             ${{ runner.temp }}/migration-evidence/**/transcript.txt
   boot:
     needs: [fast, changes]
-    # Never execute fork content with secrets via pull_request_target.
+    # Source builds use a free token for Apache build dependencies.
     if: needs.changes.outputs.native == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
+    env:
+      # A repository variable can point persistent runners at a private cache volume.
+      JAVA_UPDATE_RECIPE_CACHE: ${{ vars.JAVA_UPDATE_RECIPE_CACHE || format('{0}/recipe-cache', runner.temp) }}
     strategy:
       fail-fast: false
       matrix:
@@ -113,8 +116,21 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.14.3'
+          # Public repository caches must not distribute compiled MSAL recipes.
+          cache-disabled: true
       - run: python scripts/setup_ci_maven.py
       - run: pip install -r requirements.txt
+      - name: Build and cache recipes from source
+        run: |
+          python - <<'PY'
+          import subprocess, yaml
+          rewrite = yaml.safe_load(open('java-update.yml'))['migration']['openrewrite']
+          if rewrite.get('recipe_repository') in {'source', 'auto'}:
+              subprocess.run(['python', 'scripts/build_recipe_sources.py'], check=True)
+          PY
+        env:
+          CODE_GENOME_USERNAME: ${{ secrets.CODE_GENOME_USERNAME }}
+          CODE_GENOME_TOKEN: ${{ secrets.CODE_GENOME_TOKEN }}
       - run: python -m unittest discover -s tests -p test_integration.py -v
         env:
           JAVA_UPDATE_INTEGRATION: '1'
@@ -129,6 +145,7 @@ jobs:
           path: |
             ${{ runner.temp }}/migration-evidence/**/evidence.tar.gz
             ${{ runner.temp }}/migration-evidence/**/transcript.txt
+            ${{ env.JAVA_UPDATE_RECIPE_CACHE }}/**/logs/*.log
   migration-gate:
     needs: [fast, changes, native, boot]
     if: always()
@@ -146,5 +163,5 @@ jobs:
           assert os.environ['FAST'] == 'success' and os.environ['SCOPE'] == 'success', 'Fast checks/scope did not pass'
           if os.environ['REQUIRED'] == 'true':
               assert os.environ['NATIVE'] == 'success', 'Required real migration checks did not pass'
-              assert os.environ['BOOT'] == 'success', 'Required trusted Spring Boot checks did not pass; validate the reviewed commit on a trusted repository branch before merging/releasing'
+              assert os.environ['BOOT'] == 'success', 'Required Spring Boot migration checks did not pass'
           PY

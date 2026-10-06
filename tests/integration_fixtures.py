@@ -1,5 +1,6 @@
 """Actual builds for the documented migration matrix."""
 from pathlib import Path
+import yaml
 
 CASES = ('maven17', 'gradle17', 'maven8', 'gradle8', 'maven-bom', 'maven-multi',
          'gradle-catalog', 'gradle-multi', 'boot35-maven', 'boot4-maven', 'boot35-gradle', 'boot4-gradle')
@@ -32,13 +33,16 @@ def create(case: str, source: Path) -> tuple[str, int, dict]:
         plugins = "plugins { id 'java'" + (f"; id 'org.springframework.boot' version '{boot}'" if boot else '') + ' }\n'
         level = 'VERSION_1_8' if initial == 8 else 'VERSION_17'
         configuration = "repositories { mavenCentral() }\njava { sourceCompatibility = JavaVersion." + level + '; targetCompatibility = JavaVersion.' + level + ' }\n'
-        dependency = f"implementation platform('org.springframework.boot:spring-boot-dependencies:{boot}'); implementation 'org.springframework.boot:spring-boot-starter'; testImplementation 'org.springframework.boot:spring-boot-starter-test'" if boot else "testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'"
+        dependency = (f"    implementation platform('org.springframework.boot:spring-boot-dependencies:{boot}')\n"
+                      "    implementation 'org.springframework.boot:spring-boot-starter'\n"
+                      "    testImplementation 'org.springframework.boot:spring-boot-starter-test'" if boot
+                      else "    testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'")
         if case == 'gradle-catalog':
             catalog = source / 'gradle/libs.versions.toml'
             catalog.parent.mkdir()
             catalog.write_text('[versions]\njunit = "5.11.4"\n[libraries]\njunit = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit" }\n')
-            dependency = 'testImplementation libs.junit'
-        configuration += 'dependencies { ' + dependency + "; testRuntimeOnly 'org.junit.platform:junit-platform-launcher' }\ntest { useJUnitPlatform() }\n"
+            dependency = '    testImplementation libs.junit'
+        configuration += 'dependencies {\n' + dependency + "\n    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'\n}\ntest { useJUnitPlatform() }\n"
         if multi:
             (source / 'build.gradle').write_text("subprojects { apply plugin: 'java'\n" + configuration + '}\n')
             (package_root / 'build.gradle').write_text('// Build configured by parent.\n')
@@ -52,10 +56,13 @@ def create(case: str, source: Path) -> tuple[str, int, dict]:
     (tests / 'ServiceTest.java').write_text('package example; import org.junit.jupiter.api.Test; import static org.junit.jupiter.api.Assertions.assertEquals; public class ServiceTest { @Test public void contract() { assertEquals("ok", new Service().value()); } }\n')
     if boot:
         (main / 'Service.java').write_text('package example; import org.springframework.boot.SpringBootVersion; public class Service { public String value() { return SpringBootVersion.getVersion() != null ? "ok" : "missing"; } }\n')
+    rewrite = {'recipe_repository': 'maven-central', 'artifacts': []}
+    if boot:
+        # Exercise the same global recipe source/mirror configuration as real runs.
+        rewrite = yaml.safe_load((Path(__file__).resolve().parents[1] / 'java-update.yml').read_text())['migration']['openrewrite']
     config = {'schema_version': 1, 'targets': {'java': {'desired': target, 'acceptable': [target]},
               'spring_boot': {'desired': desired_boot, 'acceptable': [desired_boot]}},
               'migration': {'profile': 'conservative', 'verification': {'build': 'test', 'postChecks': 'none', 'strict': True},
-                            'openrewrite': {'recipe_repository': 'codegenome' if boot else 'maven-central',
-                                            'artifacts': ['org.openrewrite.recipe:rewrite-spring:6.40.0'] if boot else []}},
+                            'openrewrite': rewrite},
               'workflow': {'mode': 'unattended'}}
     return tool, target, config

@@ -900,7 +900,7 @@ def remote_recipe_repository(args: argparse.Namespace) -> str | None:
     """Return the explicitly configured recipe repository, if one is needed."""
     if args.artifact_repository:
         return args.artifact_repository
-    if args.recipe_repository == "codegenome":
+    if args.recipe_repository in {"codegenome", "source", "auto"}:
         return CODE_GENOME_URL
     return None
 
@@ -908,15 +908,24 @@ def remote_recipe_repository(args: argparse.Namespace) -> str | None:
 def gradle_repositories(args: argparse.Namespace, indent: str) -> str:
     """Generate repository declarations without writing credential values to disk."""
     repositories: list[str] = []
+    # Maven caches can contain a POM without its JAR. The local resolver skips
+    # those incomplete entries so Gradle can continue to the remote repository.
+    if args.recipe_repository in {"source", "auto"} and getattr(args, "source_plugin_repository", None):
+        repositories.append(f'{indent}mavenLocal {{ url = uri({json.dumps(args.source_plugin_repository.as_uri())}) }}')
+    if args.recipe_repository in {"source", "auto"} and getattr(args, "source_maven_repository", None):
+        repositories.append(f'{indent}mavenLocal {{ url = uri({json.dumps(args.source_maven_repository.as_uri())}) }}')
     if args.recipe_repository == "maven-local":
         repositories.append(f"{indent}mavenLocal()")
     remote = remote_recipe_repository(args)
     if remote:
         credentials = ""
-        if args.recipe_repository == "codegenome":
+        if args.recipe_repository in {"codegenome", "source", "auto"} or getattr(args, "repository_token_env", None):
+            username_env = getattr(args, "repository_username_env", None) or "CODE_GENOME_USERNAME"
+            token_env = getattr(args, "repository_token_env", None) or "CODE_GENOME_TOKEN"
             credentials = (
-                ' credentials { username = System.getenv("CODE_GENOME_USERNAME"); '
-                'password = System.getenv("CODE_GENOME_TOKEN") }'
+                f' if (System.getenv({json.dumps(username_env)}) && System.getenv({json.dumps(token_env)})) {{'
+                f' credentials {{ username = System.getenv({json.dumps(username_env)}); '
+                f'password = System.getenv({json.dumps(token_env)}) }} }}'
             )
         repositories.append(f'{indent}maven {{ url = uri("{remote}");{credentials} }}')
     repositories.append(f"{indent}mavenCentral()")
@@ -1013,8 +1022,12 @@ def write_maven_settings(path: Path, args: argparse.Namespace, env: dict[str, st
     except ET.ParseError as exc:
         raise MigrationError(f"invalid Maven settings {source}: {exc}") from exc
     repository_id = "codegenome" if args.recipe_repository == "codegenome" else "java-migrator-recipes"
-    username, token = env.get("CODE_GENOME_USERNAME"), env.get("CODE_GENOME_TOKEN")
-    if args.recipe_repository == "codegenome" and username and token:
+    if args.recipe_repository in {"source", "auto"} and getattr(args, "source_maven_repository", None):
+        xml_get_or_add(root, "localRepository").text = str(args.source_maven_repository)
+    username_env = getattr(args, "repository_username_env", None) or "CODE_GENOME_USERNAME"
+    token_env = getattr(args, "repository_token_env", None) or "CODE_GENOME_TOKEN"
+    username, token = env.get(username_env), env.get(token_env)
+    if (args.recipe_repository in {"codegenome", "source", "auto"} or getattr(args, "repository_token_env", None)) and username and token:
         servers = xml_get_or_add(root, "servers")
         for server in list(servers):
             identity = xml_find(server, "id")
@@ -1022,8 +1035,8 @@ def write_maven_settings(path: Path, args: argparse.Namespace, env: dict[str, st
                 servers.remove(server)
         server = ET.SubElement(servers, xml_name(root, "server"))
         xml_add(server, "id", repository_id)
-        xml_add(server, "username", "${env.CODE_GENOME_USERNAME}")
-        xml_add(server, "password", "${env.CODE_GENOME_TOKEN}")
+        xml_add(server, "username", "${env." + username_env + "}")
+        xml_add(server, "password", "${env." + token_env + "}")
     profiles = xml_get_or_add(root, "profiles")
     profile = ET.SubElement(profiles, xml_name(root, "profile"))
     profile_id = "java-migrator-recipes"
@@ -1510,8 +1523,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     dependency_policy = policy.get("dependencies", {})
     verification_policy = policy.get("verification", {})
     reporting_policy = policy.get("reporting", {})
+    repository_policy = policy.get("openrewrite", {})
     if not all(isinstance(item, dict) for item in
-               (packs, dependency_policy, verification_policy, reporting_policy)):
+               (packs, dependency_policy, verification_policy, reporting_policy, repository_policy)):
         raise MigrationError(
             "policy packs, dependencies, verification, and reporting values must be mappings"
         )
@@ -1601,14 +1615,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help="treat diagnostic/custom post-check warnings as failures")
     parser.add_argument(
         "--recipe-repository",
-        choices=("maven-central", "maven-local", "codegenome"),
+        choices=("source", "auto", "maven-central", "maven-local", "codegenome"),
         default="maven-central",
-        help="where recipe artifacts are resolved; Code Genome is opt-in",
+        help="where recipe artifacts are resolved; source builds use the private local cache",
     )
     parser.add_argument(
         "--artifact-repository",
+        default=repository_policy.get("artifact_repository"),
         help="optional Maven-compatible mirror/remote URL (supplements the selected mode)",
     )
+    parser.add_argument("--recipe-cache", type=Path,
+                        default=os.environ.get("JAVA_UPDATE_RECIPE_CACHE") or repository_policy.get("source_cache"))
+    parser.add_argument("--recipe-source-lock", type=Path, default=repository_policy.get("source_lock"))
+    parser.add_argument("--repository-username-env", default=repository_policy.get("repository_username_env"))
+    parser.add_argument("--repository-token-env", default=repository_policy.get("repository_token_env"))
     parser.add_argument("--maven-plugin-version", help="automatic for the selected repository mode")
     parser.add_argument("--gradle-plugin-version", help="automatic for the selected repository mode")
     parser.add_argument("--migrate-java-version", help="automatic for the selected repository mode")
@@ -1622,6 +1642,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--push requires --commit and a non-empty --branch")
     if args.recipe_repository == "maven-local" and args.artifact_repository:
         parser.error("--artifact-repository cannot be combined with --recipe-repository maven-local")
+    for key in (args.repository_username_env, args.repository_token_env):
+        if key and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            parser.error("repository credential settings must name environment variables")
+    if args.artifact_repository:
+        url = urllib.parse.urlsplit(args.artifact_repository)
+        if url.scheme not in {"https", "http", "file"} or url.username or url.password or any(c in args.artifact_repository for c in '\n\r"'):
+            parser.error("--artifact-repository must be a Maven URL without embedded credentials")
     if args.profile not in PROFILE_DEFAULTS:
         parser.error(f"unknown profile in policy: {args.profile}")
     if args.target_java not in TARGETS:
@@ -1663,7 +1690,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             parser.error("--dependency-pin must use G:A=VERSION")
         args.dependency_pin[pattern] = version
     args.policy_data = policy
-    defaults = CODE_GENOME_VERSIONS if args.recipe_repository == "codegenome" else MAVEN_CENTRAL_VERSIONS
+    defaults = CODE_GENOME_VERSIONS if args.recipe_repository in {"codegenome", "source", "auto"} else MAVEN_CENTRAL_VERSIONS
     for name, value in defaults.items():
         attribute = f"{name}_version"
         if getattr(args, attribute) is None:
@@ -1684,6 +1711,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         env = os.environ.copy()
         env["MIGRATOR_GIT_TOKEN"] = env.get(args.git_token_env, "")
         env["MIGRATOR_GIT_USERNAME"] = args.git_username
+        if args.recipe_repository in {"source", "auto"} and not args.dry_run and artifacts(args):
+            from java_update_tool.recipe_sources import DEFAULT_CACHE, DEFAULT_LOCK, SourceBuildError, prepare
+            try:
+                args.source_maven_repository = None
+                if args.recipe_repository == "auto":
+                    from java_update_tool.recipe_binaries import try_repository
+                    args.source_maven_repository = try_repository(artifacts(args), cache=args.recipe_cache or DEFAULT_CACHE,
+                        lock_path=args.recipe_source_lock or DEFAULT_LOCK, remote=args.artifact_repository,
+                        username_env=args.repository_username_env or "CODE_GENOME_USERNAME",
+                        token_env=args.repository_token_env or "CODE_GENOME_TOKEN", env=env)
+                    if args.source_maven_repository is not None:
+                        args.source_plugin_repository = prepare([], cache=args.recipe_cache or DEFAULT_CACHE,
+                            lock_path=args.recipe_source_lock or DEFAULT_LOCK,
+                            remote=remote_recipe_repository(args) or CODE_GENOME_URL,
+                            username_env=args.repository_username_env or "CODE_GENOME_USERNAME",
+                            token_env=args.repository_token_env or "CODE_GENOME_TOKEN", env=env)
+                if args.source_maven_repository is None:
+                    args.source_maven_repository = prepare(artifacts(args), cache=args.recipe_cache or DEFAULT_CACHE,
+                        lock_path=args.recipe_source_lock or DEFAULT_LOCK,
+                        remote=remote_recipe_repository(args) or CODE_GENOME_URL,
+                        username_env=args.repository_username_env or "CODE_GENOME_USERNAME",
+                        token_env=args.repository_token_env or "CODE_GENOME_TOKEN", env=env)
+            except SourceBuildError as exc:
+                raise MigrationError(str(exc)) from exc
         with tempfile.TemporaryDirectory(prefix="java-migrator-", dir=state) as temp:
             askpass = make_askpass(Path(temp))
             say(

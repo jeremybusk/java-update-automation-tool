@@ -34,7 +34,20 @@
       "type": "object"
     },
     "migration": {
-      "type": "object"
+      "type": "object",
+      "properties": {
+        "openrewrite": {
+          "type": "object",
+          "properties": {
+            "recipe_repository": {"enum": ["source", "auto", "maven-central", "codegenome", "maven-local"]},
+            "artifact_repository": {"type": ["string", "null"]},
+            "source_cache": {"type": "string", "minLength": 1},
+            "source_lock": {"type": "string", "minLength": 1},
+            "repository_username_env": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
+            "repository_token_env": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"}
+          }
+        }
+      }
     },
     "workflow": {
       "type": "object",

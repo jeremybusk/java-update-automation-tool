@@ -60,7 +60,7 @@ Validation requires fresh executed tests and effective compiler/dependency evide
 
 Use `--repo`, `--application`, `--application-group`, or `--all` to select scope. Dependency waves block dependents after migration failure. Dependencies outside the selection need matching validation evidence; `--include-dependencies` includes them recursively. A manual experiment override is recorded and blocks publication.
 
-The checked-in policy targets Java 25 and Spring Boot 4.0.x. It uses the configured Code Genome recipe artifacts and requires `CODE_GENOME_USERNAME` / `CODE_GENOME_TOKEN` for execution. For Java-only migrations, set `recipe_repository: maven-central` and clear the artifact list. Spring migrations require an explicitly pinned `rewrite-spring` artifact matching the configured recipe repository. Target recipes are selected automatically; explicit additions must agree with targets.
+The checked-in policy targets Java 25 and Spring Boot 4.0.x. Its global `migration.openrewrite` configuration defaults to building pinned recipe sources and reusing a private local cache. It also supports `auto` (binary downloads with source fallback), Maven Central, Code Genome, Maven local, and a Nexus Maven repository URL. Source builds need JDK 21 and a free Code Genome token for Apache build dependencies; prebuilt MSAL recipe downloads require customer entitlement. Target recipes are selected automatically; explicit additions must agree with targets. See [recipe sources, caching, and repository settings](notes/workflow.md#recipe-sources-and-source-builds).
 
 See [the workflow guide](notes/workflow.md) for complete config examples, credentials, validation behavior, retry semantics, integration tests, and exit codes. Editor schemas live in [`schemas/`](schemas/).
 
@@ -70,6 +70,6 @@ See [the workflow guide](notes/workflow.md) for complete config examples, creden
 python3 -B -m unittest discover -s tests -v
 ```
 
-Normal tests use temporary Git repositories, deterministic migration/build boundaries, and local fake hosting APIs. The opt-in integration matrix covers Maven/Gradle Java 17→21 and 8→25, BOMs, multi-project builds, catalogs, and Spring Boot 3.4→3.5→4.0. GitHub CI runs authenticated Boot checks with `CODE_GENOME_USERNAME` and `CODE_GENOME_TOKEN` secrets on trusted jobs; missing prerequisites fail required checks. See the workflow guide for the precise fixture and toolchain matrix.
+Normal tests use temporary Git repositories, deterministic migration/build boundaries, and local fake hosting APIs. The opt-in integration matrix covers Maven/Gradle Java 17→21 and 8→25, BOMs, multi-project builds, catalogs, and Spring Boot 3.4→3.5→4.0. Boot checks use the global recipe configuration and source builds on trusted jobs; the Java-only baseline uses Maven Central. Missing prerequisites fail required checks. See the workflow guide for the precise fixture and toolchain matrix.
 
 `migrate.py` remains available for direct OpenRewrite execution. `portfolio.py` uses the six-stage workflow exclusively. The reusable [report skill](skills/java-update-reports/SKILL.md) regenerates Markdown from retained JSON.
