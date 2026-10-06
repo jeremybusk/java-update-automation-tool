@@ -172,9 +172,10 @@ or altered files rebuild their recipe. The cache key includes the lock file,
 builder code, compiler JDK identity, and remote repository URL. Build logs are
 kept inside the cache.
 
-The four Boot matrix checks run in parallel on separate hosted runners, each
-with its own source cache. Multiple warm-cache commands using the same cache
-serialize behind a build lock. For planning, allow 15–30+ minutes for cold recipe
+The four Boot checks share one hosted runner and private source cache. CI warms
+recipes once, then runs at most two migration cases concurrently. Multiple
+warm-cache commands using the same cache serialize behind a build lock.
+For planning, allow 15–30+ minutes for cold recipe
 preparation, plus migration and application tests; this estimate has not been
 measured on a fresh GitHub Actions runner.
 
@@ -408,6 +409,14 @@ from these checked-in workflows.
 | gradle-catalog | Java 17 → 21 | Dependency version catalog |
 | boot35-maven, boot35-gradle | Boot 3.4.2 → 3.5.x; Java 17 → 21 | Framework recipes |
 | boot4-maven, boot4-gradle | Boot 3.5.1 → 4.0.x; Java 17 → 21 | Framework recipes |
+
+CI caches pip downloads, the checksum-verified Maven 3.9.11 archive, and Maven
+dependencies for Java-only cases. Native jobs install only their required build
+tool; Gradle jobs retain their existing dependency cache. Boot jobs keep compiled
+recipes and Gradle caches private to the runner. Superseded pull-request runs
+are cancelled automatically. Integration timings,
+including recipe preparation, appear in the job summary. Tests still execute
+freshly; cached build output cannot qualify as validation evidence.
 
 CI uses Maven 3.9.11, Gradle 8.14.3 with JDK 21 for Java-21/Boot cases, and Gradle
 9.1.0 with JDK 25 for Java-25 cases. Recipe versions are pinned in the migration
