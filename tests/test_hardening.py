@@ -284,6 +284,31 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(0, self.invoke('run', '--source-selection', 'current', '--through', STAGES[0])[0])
         self.assertEqual(git(self.source, 'rev-parse', 'HEAD'), read_json(self.run_root() / 'run.json')['sources']['api']['commit'])
 
+    def test_remote_snapshot_ignores_unrelated_ref_suffix_matches(self):
+        older = git(self.source, 'rev-parse', 'v1')
+        git(self.source, 'update-ref', 'refs/remotes/origin/master', older)
+        git(self.source, 'branch', 'archive/master', older)
+        git(self.source, 'tag', '-a', 'release', older, '-m', 'Annotated baseline')
+        for ref, expected in ((self.original, self.original), ('master', self.original),
+                              ('refs/heads/master', self.original), ('release', older),
+                              ('refs/tags/release', older)):
+            with self.subTest(ref=ref):
+                self.portfolio['repositories'][0].update(source=self.source.as_uri(), ref=ref)
+                self.save()
+                code, output = self.invoke('run', '--through', STAGES[0])
+                self.assertEqual(0, code, output)
+                receipt = read_json(self.run_root() / 'run.json')['sources']['api']
+                self.assertEqual(expected, receipt['commit'])
+                self.assertEqual(self.original, receipt['request_base_commit'])
+
+    def test_remote_short_ref_rejects_branch_tag_collision(self):
+        git(self.source, 'tag', 'maintenance', 'v1')
+        self.portfolio['repositories'][0].update(source=self.source.as_uri(), ref='maintenance')
+        self.save()
+        code, output = self.invoke('run', '--through', STAGES[0])
+        self.assertEqual(2, code)
+        self.assertIn('source ref cannot be resolved unambiguously', output)
+
     def test_all_history_drift_never_publishes_changed_refs(self):
         self.config['workflow']['publishing'] = {'history': 'all'}
         self.save()

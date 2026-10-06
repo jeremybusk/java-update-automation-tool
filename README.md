@@ -8,7 +8,9 @@ python3 portfolio.py validate
 python3 portfolio.py run --application legacy-catalog
 ```
 
-The checked-in portfolio contains local examples. A default run requests review after discovery and stops at planning once its checkpoints are approved. Migration requires `--execute`; the default publishing target is an inspectable local Git repository.
+The checked-in portfolio contains local Java 8 fixtures and pinned public demo codebases. Start with `--application legacy-catalog` for the local fixtures or `--repo spring-petclinic` for a Spring Boot application with Maven and Gradle builds. See [demo repositories and recipe references](examples/demo-repositories.md) for baselines, commands, and prerequisites. An unfiltered run selects the entire portfolio, including the large Baeldung tutorials collection.
+
+A default run requests review after discovery and stops at planning once its checkpoints are approved. Migration requires `--execute`; the default publishing target is an inspectable local Git repository.
 
 ## Stages
 

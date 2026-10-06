@@ -1,3 +1,7 @@
 # One URL per line. An optional branch/tag/SHA may follow the URL.
-https://github.com/example/service-one.git main
-https://github.com/example/service-two.git
+# Public demo baselines matching repositories.yml. Select one for a first run.
+# Usage and prerequisites: examples/demo-repositories.md.
+https://github.com/spring-projects/spring-petclinic.git 6148ddd9671ccab86a3f0ae2dfa77d833b713ee8
+https://github.com/spring-petclinic/spring-petclinic-microservices.git f9fd559361f11b79e622ee0c0c660f42980a36ac
+https://github.com/eclipse-ee4j/cargotracker.git e6b8648cda2754aee39cb536c807b051cab74b61
+https://github.com/eugenp/tutorials.git 346395d72eab1d59bd6052d23ee6a4e9c36dc24a

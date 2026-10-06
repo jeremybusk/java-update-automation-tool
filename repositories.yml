@@ -1,7 +1,10 @@
-# Minimal portfolio example. repo_id is optional; repo_name becomes the stable
-# key when repo_id is omitted. Paths are relative to this file.
+# Demo portfolio: local fixtures and public recipe targets.
+# See examples/demo-repositories.md for selection, execution, and prerequisites.
+# repo_id is optional; repo_name becomes the stable key when omitted.
+# Paths are relative to this file. Public refs pin older migration inputs.
 schema_version: 1
 repositories:
+  # Small Java 8 / JUnit 4 fixtures; no source downloads required.
   - repo_name: legacy-catalog-maven
     repo_id: catalog-api
     source: examples/java8-maven
@@ -16,3 +19,37 @@ repositories:
     application_group_id: commerce
     role: worker
     depends_on: [catalog-api]
+
+  # Java 17, Spring Boot 3.4.0; both Maven and Gradle at the repository root.
+  - repo_name: spring-petclinic
+    source: https://github.com/spring-projects/spring-petclinic.git
+    ref: "6148ddd9671ccab86a3f0ae2dfa77d833b713ee8"
+    application_id: spring-petclinic
+    application_group_id: spring-baseline
+    role: reference-app
+
+  # v3.4.1: Java 17, Boot 3.4.1, Cloud 2024.0.0; Maven multi-module reactor.
+  - repo_name: spring-petclinic-microservices
+    source: https://github.com/spring-petclinic/spring-petclinic-microservices.git
+    ref: "f9fd559361f11b79e622ee0c0c660f42980a36ac"
+    application_id: petclinic-microservices
+    application_group_id: spring-cloud
+    role: microservices
+
+  # Official Cargo Tracker location. The jakartaee8 baseline uses javax APIs,
+  # Java 8, and Payara 5; namespace/server upgrades need additional recipes.
+  - repo_name: cargotracker
+    source: https://github.com/eclipse-ee4j/cargotracker.git
+    ref: "e6b8648cda2754aee39cb536c807b051cab74b61"
+    application_id: cargo-tracker
+    application_group_id: jakarta-ee
+    role: enterprise-app
+
+  # Large collection, pinned to a January 2025 baseline. Inventory first;
+  # review module scope and external-service prerequisites before execution.
+  - repo_name: baeldung-tutorials
+    source: https://github.com/eugenp/tutorials.git
+    ref: "346395d72eab1d59bd6052d23ee6a4e9c36dc24a"
+    application_id: baeldung-tutorials
+    application_group_id: library-examples
+    role: recipe-samples
