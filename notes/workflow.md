@@ -23,7 +23,7 @@ workflow:
 
 CLI overrides: `--mode manual|unattended`, `--[no-]show-diffs`, `--[no-]include-dependencies`, `--[no-]dependency-override`, `--[no-]enable-publishing`, and repeatable `--publish-target local_repo|src_repo|dst_repo`. They become part of the saved run; provide the same overrides on resume. `--execute` authorizes migration/publication execution and can be added after preparing commands.
 
-A new invocation without `--resume` creates a separate run. `--from STAGE` reruns that stage and downstream requested stages in a saved run. Successful repository migrations and publishing target receipts are reused; failed migration attempts are kept in unique directories. To migrate new source content or change policy, create a new run. The report script reads retained runs using `--run-id` (default: `latest`).
+A new invocation without `--resume` creates a separate run. `--from STAGE` reruns that stage and downstream requested stages in a saved run. A plain resume reuses successful repository migrations; explicitly restarting at migration or an earlier stage creates fresh migration attempts. Publishing reconciles existing target receipts. All migration attempts are kept in unique directories. To migrate new source content or change policy, create a new run. The report script reads retained runs using `--run-id` (default: `latest`).
 
 ## Retained resources and reviews
 
@@ -54,6 +54,8 @@ Approvals bind captured policy/source commits, stage JSON, execution policies, a
 `runs` lists retained runs; `diff RUN_ID --compare-to OTHER_RUN_ID` creates a policy/source/output comparison. `show_diffs: true` generates comparisons with the previous retained run at checkpoints. Reports are generated views: regenerate with `portfolio.py report --run-id RUN_ID` or `scripts/render_reports.py --state .java-update --run-id RUN_ID`. Editing Markdown does not approve a stage.
 
 Local Git inputs must be clean; requested local and remote refs are honored. Remote discovery snapshots are shallow. Before publication, fetch full required ancestry; validation is tied to the same migrated commit and does not rerun merely to expand history.
+
+Discovery, migration, and validation share `discovery.max_depth` (default: 5).
 
 ## Dependencies, recipes, and pins
 
@@ -325,6 +327,8 @@ legitimately testless project. Declared Maven Failsafe checks run through `verif
 declared Gradle integration/contract tasks and configured suites also need fresh
 reports. Use configured suites for nonstandard task/report conventions. Report
 exemptions and exclusions are part of the validation policy and approvals.
+Custom suites retain separate evidence from automatically detected suites, even
+when their names match.
 
 Maven compliance follows the effective compiler release/target configuration and
 executions. Informational `java.version` values are recorded separately. Resolved

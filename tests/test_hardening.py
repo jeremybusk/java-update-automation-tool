@@ -34,6 +34,175 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(0, code, output)
         return self.run_root()
 
+    def test_explicit_migration_restart_creates_fresh_attempts(self):
+        root = self.pipeline(STAGES[4])
+        path = artifact_path(root, STAGES[3], 'repositories', 'api')
+        first = read_json(path)
+        for stage in (STAGES[3], STAGES[2]):
+            with self.external_tools():
+                code, output = self.invoke('run', '--resume', root.name, '--from', stage,
+                                           '--through', STAGES[3], '--execute')
+            self.assertEqual(0, code, output)
+            second = read_json(path)
+            self.assertNotEqual(first['output'], second['output'])
+            self.assertTrue(Path(first['output']).is_dir())
+            self.assertNotIn(STAGES[4], read_json(root / 'run.json')['stages'])
+            first = second
+
+    def test_plain_resume_reuses_successful_migrations_after_partial_failure(self):
+        self.add_worker(independent=True)
+        def migrate(argv):
+            if Path(argv[2]).name == 'worker':
+                raise PortfolioError('temporary migration failure')
+            return self.fake_migration(argv)
+        with patch('java_update_tool.cli.execute_migration', side_effect=migrate):
+            code, output = self.invoke('run', '--through', STAGES[3], '--execute')
+        self.assertEqual(1, code, output)
+        root = self.run_root()
+        path = artifact_path(root, STAGES[3], 'repositories', 'api')
+        first = read_json(path)
+        with patch('java_update_tool.cli.execute_migration', side_effect=self.fake_migration) as execute:
+            code, output = self.invoke('run', '--resume', root.name, '--through', STAGES[3], '--execute')
+        self.assertEqual(0, code, output)
+        self.assertEqual(1, execute.call_count)
+        self.assertEqual(first, read_json(path))
+
+    def test_restarted_migration_requires_fresh_validation_before_publication(self):
+        root = self.pipeline(STAGES[4])
+        with self.external_tools():
+            code, output = self.invoke('run', '--resume', root.name, '--from', STAGES[3],
+                                       '--through', STAGES[3], '--execute')
+        self.assertEqual(0, code, output)
+        code, output = self.invoke('run', '--resume', root.name, '--from', STAGES[5],
+                                   '--through', STAGES[5], '--execute')
+        self.assertEqual(2, code, output)
+        self.assertIn('requires current completed validation', output)
+        self.assertFalse((root / 'local-repositories').exists())
+
+    def test_migration_uses_configured_discovery_depth(self):
+        self.config['discovery'] = {'max_depth': 6}
+        self.save()
+        nested = self.source / 'a/b/c/d/e/f'
+        nested.mkdir(parents=True)
+        (nested / 'pom.xml').write_text(fixtures.POM)
+        git(self.source, 'add', '--all')
+        git(self.source, 'commit', '-m', 'Add deeply nested build')
+        code, output = self.invoke('run', '--through', STAGES[3])
+        self.assertEqual(0, code, output)
+        root = self.run_root()
+        discovered = read_json(artifact_path(root, STAGES[0], 'repositories', 'api'))
+        migration = read_json(artifact_path(root, STAGES[3], 'repositories', 'api'))
+        args = engine.parse_args(migration['command'][2:])
+        builds = engine.discover_builds(Path(args.sources[0]), args.build_tool, args.max_depth)
+        self.assertEqual(6, args.max_depth)
+        self.assertEqual({item['path'] for item in discovered['projects']},
+                         {str(build.path.relative_to(Path(args.sources[0]))) for build in builds})
+
+    def test_invalid_discovery_options_fail_before_creating_a_run(self):
+        for options in ({'max_depth': -1}, {'max_depth': True}, {'max_depth': '5'},
+                        {'build_tool': 'unknown'}, {'build_tool': []}, []):
+            with self.subTest(options=options):
+                self.config['discovery'] = options
+                self.save()
+                code, output = self.invoke('validate')
+                self.assertEqual(2, code, output)
+                self.assertIn('discovery', output)
+        self.assertFalse(self.state.exists())
+
+    def test_empty_resume_preserves_failed_and_published_outcomes(self):
+        with self.external_tools(), patch('java_update_tool.validation.command', side_effect=PortfolioError('build failed')):
+            code, output = self.invoke('run', '--through', STAGES[5], '--execute')
+        self.assertEqual(1, code, output)
+        root = self.run_root()
+        before = read_json(root / 'run.json')
+        self.assertEqual(1, self.invoke('run', '--resume', root.name)[0])
+        self.assertEqual(before, read_json(root / 'run.json'))
+        with self.external_tools():
+            code, output = self.invoke('run', '--resume', root.name, '--through', STAGES[5], '--execute')
+        self.assertEqual(0, code, output)
+        before = read_json(root / 'run.json')
+        self.assertEqual(0, self.invoke('run', '--resume', root.name)[0])
+        self.assertEqual(before, read_json(root / 'run.json'))
+
+    def test_missing_migrated_build_retains_validation_failure(self):
+        root = self.pipeline(STAGES[3])
+        result = read_json(artifact_path(root, STAGES[3], 'repositories', 'api'))
+        output = Path(result['output'])
+        git(output, 'rm', 'pom.xml')
+        git(output, 'commit', '-m', 'Remove build')
+        code, transcript = self.invoke('run', '--resume', root.name, '--through', STAGES[5], '--execute')
+        self.assertEqual(1, code, transcript)
+        validation = read_json(artifact_path(root, STAGES[4], 'repositories', 'api'))
+        self.assertEqual('failed', validation['status'])
+        self.assertIn('no Maven or Gradle build', validation['error'])
+        self.assertFalse((root / STAGES[5]).exists())
+
+    def test_custom_integration_suite_preserves_builtin_evidence(self):
+        from java_update_tool.validation import verify_validation_evidence
+        pom = self.source / 'pom.xml'
+        pom.write_text(pom.read_text().replace('</project>', '<build><plugins><plugin><artifactId>maven-failsafe-plugin</artifactId></plugin></plugins></build></project>'))
+        git(self.source, 'add', 'pom.xml')
+        git(self.source, 'commit', '-m', 'Declare integration suite')
+        self.config['workflow']['validation'] = {'suites': [
+            {'name': 'integration', 'command': ['custom-integration'], 'reports': ['target/custom/TEST-*.xml']}]}
+        self.save()
+        def build(argv, cwd, timeout=300):
+            result = self.fake_build(argv, cwd, timeout)
+            if 'verify' in argv or 'custom-integration' in argv:
+                custom = 'custom-integration' in argv
+                path = cwd / ('target/custom/TEST-contract.xml' if custom else 'target/failsafe-reports/TEST-contract.xml')
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f'<testsuite tests="{3 if custom else 2}"/>')
+            return result
+        with self.external_tools(), patch('java_update_tool.validation.command', side_effect=build):
+            code, transcript = self.invoke('run', '--through', STAGES[5], '--execute')
+        self.assertEqual(0, code, transcript)
+        value = read_json(artifact_path(self.run_root(), STAGES[4], 'repositories', 'api'))
+        verify_validation_evidence(value)
+        proofs = [proof for proof in value['test_evidence'] if proof['suite'] == 'integration']
+        self.assertEqual([2, 3], [proof['counts']['tests'] for proof in proofs])
+        self.assertNotEqual(proofs[0]['reports'][0]['resource'], proofs[1]['reports'][0]['resource'])
+
+    def test_failed_custom_suite_preserves_completed_build_evidence(self):
+        self.config['workflow']['validation'] = {'suites': [
+            {'name': 'contract', 'command': ['contract-check'], 'reports': ['target/contracts/TEST-*.xml']}]}
+        self.save()
+        def build(argv, cwd, timeout=300):
+            if 'contract-check' in argv:
+                raise PortfolioError('contract failed')
+            return self.fake_build(argv, cwd, timeout)
+        with self.external_tools(), patch('java_update_tool.validation.command', side_effect=build):
+            code, transcript = self.invoke('run', '--through', STAGES[5], '--execute')
+        self.assertEqual(1, code, transcript)
+        root = self.run_root()
+        value = read_json(artifact_path(root, STAGES[4], 'repositories', 'api'))
+        self.assertEqual('contract failed', value['error'])
+        self.assertEqual(['passed', 'failed'], [check['status'] for check in value['checks']])
+        self.assertEqual('executed', value['test_evidence'][0]['status'])
+        self.assertTrue(Path(value['test_evidence'][0]['reports'][0]['resource']).is_file())
+        self.assertFalse((root / 'local-repositories').exists())
+
+    def test_missing_engine_summary_records_executed_migration_failure(self):
+        self.add_worker()
+        def migrate(argv):
+            completed = self.fake_migration(argv)
+            workspace = Path(argv[argv.index('--workspace') + 1])
+            (workspace / 'reports/summary.json').unlink()
+            return completed
+        with patch('java_update_tool.cli.execute_migration', side_effect=migrate) as execute:
+            code, transcript = self.invoke('run', '--through', STAGES[3], '--execute')
+        self.assertEqual(1, code, transcript)
+        self.assertEqual(1, execute.call_count)
+        root = self.run_root()
+        failed = read_json(artifact_path(root, STAGES[3], 'repositories', 'api'))
+        blocked = read_json(artifact_path(root, STAGES[3], 'repositories', 'worker'))
+        self.assertEqual('failed', failed['status'])
+        self.assertTrue(failed['executed'])
+        self.assertEqual(0, failed['exit_code'])
+        self.assertIn('missing', failed['error'])
+        self.assertEqual(['api'], blocked['blocked_by'])
+        self.assertFalse(blocked['executed'])
+
     def test_resume_partial_snapshot_keeps_first_and_finishes_second(self):
         second = self.root / 'second'
         command(['git', 'clone', str(self.source), str(second)], self.root)

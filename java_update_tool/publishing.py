@@ -161,6 +161,8 @@ def provider_location(url: str) -> tuple[str, str]:
 
 def publish_stage(selected: Sequence[Repository], config: dict[str, Any], workflow: dict[str, Any], root: Path) -> list[dict[str, Any]]:
     receipt = read_json(root / "run.json")
+    if receipt["stages"].get(STAGES[4], {}).get("status") not in {"complete", "partial"}:
+        raise PortfolioError("publishing requires current completed validation; rerun stage 05-validation")
     publishing = workflow["publishing"]
     validation = {repo.key: read_json(artifact_path(root, STAGES[4], "repositories", repo.key)) for repo in selected}
     aliases = {alias: repo.key for repo in selected for alias in (repo.key, repo.repo_name)}

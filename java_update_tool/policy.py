@@ -41,6 +41,7 @@ def validate_commands(commands: Any) -> None:
 def validate_validation(options: dict[str, Any]) -> None:
     if options["build"] not in {"compile", "test"} or type(options["timeout"]) is not int or options["timeout"] < 1:
         raise PortfolioError("validation requires build=compile/test and positive timeout")
+    validate_commands(options["commands"])
     if not isinstance(options["build_roots"], list) or any(not isinstance(path, str) or invalid_relative_path(path) for path in options["build_roots"]):
         raise PortfolioError("validation.build_roots must contain relative build directories")
     for key in ("exclusions", "test_exemptions"):
@@ -155,11 +156,6 @@ def workflow_policy(config: dict[str, Any], overrides: dict[str, Any] | None = N
     if any(not isinstance(key, str) or not isinstance(value, str) or not value for key, value in result["dependency_evidence"].items()):
         raise PortfolioError("dependency_evidence must map repository keys to evidence paths")
     validation = result["validation"]
-    if validation["build"] not in {"compile", "test"}:
-        raise PortfolioError("workflow.validation.build must be compile or test")
-    if type(validation["timeout"]) is not int or validation["timeout"] < 1:
-        raise PortfolioError("workflow.validation.timeout must be positive")
-    validate_commands(validation["commands"])
     validate_validation(validation)
     if not isinstance(validation["repositories"], dict):
         raise PortfolioError("workflow.validation.repositories must be a repository-key mapping")
@@ -167,7 +163,6 @@ def workflow_policy(config: dict[str, Any], overrides: dict[str, Any] | None = N
         if not isinstance(value, dict) or set(value) - (set(validation) - {"repositories"}):
             raise PortfolioError("unknown repository validation option")
         validate_validation({**validation, **value})
-        validate_commands(value.get("commands", []))
     publishing = result["publishing"]
     validate_publishing(publishing)
     if not isinstance(publishing["targets"], list) or not publishing["targets"] or any(

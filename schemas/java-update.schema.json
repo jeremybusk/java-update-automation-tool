@@ -28,7 +28,11 @@
       "additionalProperties": true
     },
     "discovery": {
-      "type": "object"
+      "type": "object",
+      "properties": {
+        "build_tool": {"enum": ["auto", "maven", "gradle"]},
+        "max_depth": {"type": "integer", "minimum": 0}
+      }
     },
     "alignment": {
       "type": "object"
