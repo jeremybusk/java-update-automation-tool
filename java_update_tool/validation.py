@@ -242,6 +242,60 @@ def declared_integration(build: engine.BuildRoot, effective_pom: Path | None = N
     return {"tasks": sorted(set(tasks)), "suites": suites, "reports": [pattern for patterns in suites.values() for pattern in patterns]}
 
 
+def _validate_build(build: engine.BuildRoot, build_root: str, directory: Path,
+                    options: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    """Run one build and retain each check before execution, including failures."""
+    directory.mkdir(exist_ok=True)
+    executable = engine.executable(build)
+    timeout = options["timeout"]
+    result["toolchains"].append({
+        "build_root": build_root, "executable": executable,
+        "version": command([executable, "--version"], build.path, timeout),
+    })
+    maven = build.tool == "maven"
+    args = [executable, "-B"] if maven else [executable, "--no-daemon", "--rerun-tasks", "--no-build-cache"]
+    unit = ["**/target/surefire-reports/TEST-*.xml"] if maven else ["**/build/test-results/test/TEST-*.xml"]
+    effective_pom = None
+    if maven:
+        effective_pom = directory / "effective-pom.xml"
+        command([executable, "-B", "help:effective-pom", f"-Doutput={effective_pom}"], build.path, timeout)
+    integration = declared_integration(build, effective_pom)
+    reports = unit + integration["reports"]
+    clear_reports(build.path, reports)
+    if maven and integration["reports"]:
+        task = "verify"
+    elif options["build"] == "test":
+        task = "test"
+    else:
+        task = "compile" if maven else "classes"
+    argv = [*args, task]
+    if not maven and integration["tasks"]:
+        argv += integration["tasks"]
+    check = {"name": directory.name, "build_root": build_root, "status": "failed", "command": argv}
+    result["checks"].append(check)
+    command(argv, build.path, timeout)
+    check["status"] = "passed"
+    suites = {"unit": unit, **integration["suites"]}
+    for name, globs in suites.items():
+        proof = test_evidence(build.path, globs, name, options["test_exemptions"].get(name), directory)
+        proof.update(build_root=build_root, command=argv)
+        result["test_evidence"].append(proof)
+    for suite in options["suites"]:
+        name = suite["name"]
+        clear_reports(build.path, suite["reports"])
+        check = {"name": name, "status": "failed", "command": suite["command"]}
+        result["checks"].append(check)
+        command(suite["command"], build.path, timeout)
+        custom_directory = directory / "custom"
+        custom_directory.mkdir(exist_ok=True)
+        proof = test_evidence(build.path, suite["reports"], name,
+                              options["test_exemptions"].get(name), custom_directory)
+        proof.update(build_root=build_root, command=suite["command"])
+        result["test_evidence"].append(proof)
+        check["status"] = "passed"
+    return inventory(build, directory, timeout, effective_pom)
+
+
 def validate_stage(selected: Sequence[Repository], portfolio: Portfolio, config: dict[str, Any], workflow: dict[str, Any], root: Path) -> list[dict[str, Any]]:
     results, discoveries = [], []
     checkouts = {}
@@ -292,46 +346,12 @@ def validate_stage(selected: Sequence[Repository], portfolio: Portfolio, config:
             inventory_resources = []
             for index, build in enumerate(required):
                 build_directory = directory / f"build-{index}"
-                build_directory.mkdir(exist_ok=True)
-                executable = engine.executable(build)
-                result["toolchains"].append({"build_root": str(build.path.relative_to(output)), "executable": executable,
-                                             "version": command([executable, "--version"], build.path, options["timeout"])})
-                maven = build.tool == "maven"
-                args = [executable, "-B"] if maven else [executable, "--no-daemon", "--rerun-tasks", "--no-build-cache"]
-                unit = ["**/target/surefire-reports/TEST-*.xml"] if maven else ["**/build/test-results/test/TEST-*.xml"]
-                effective_pom = None
-                if maven:
-                    effective_pom = build_directory / "effective-pom.xml"
-                    command([executable, "-B", "help:effective-pom", f"-Doutput={effective_pom}"], build.path, options["timeout"])
-                integration = declared_integration(build, effective_pom)
-                reports = unit + integration["reports"]
-                clear_reports(build.path, reports)
-                task = "verify" if maven and integration["reports"] else "test" if options["build"] == "test" else "compile" if maven else "classes"
-                argv = [*args, task]
-                if not maven and integration["tasks"]:
-                    argv += integration["tasks"]
-                check = {"name": f"build-{index}", "build_root": str(build.path.relative_to(output)), "status": "failed", "command": argv}
-                result["checks"].append(check)
-                command(argv, build.path, options["timeout"])
-                check["status"] = "passed"
-                for name, globs in [("unit", unit), *[(name, paths) for name, paths in integration["suites"].items()]]:
-                    proof = test_evidence(build.path, globs, name, options["test_exemptions"].get(name), build_directory)
-                    proof.update(build_root=check["build_root"], command=argv)
-                    result["test_evidence"].append(proof)
-                for suite in options["suites"]:
-                    clear_reports(build.path, suite["reports"])
-                    check = {"name": suite["name"], "status": "failed", "command": suite["command"]}
-                    result["checks"].append(check)
-                    command(suite["command"], build.path, options["timeout"])
-                    proof = test_evidence(build.path, suite["reports"], suite["name"], options["test_exemptions"].get(suite["name"]), build_directory)
-                    proof.update(build_root=str(build.path.relative_to(output)), command=suite["command"])
-                    result["test_evidence"].append(proof)
-                    check["status"] = "passed"
-                values = inventory(build, build_directory, options["timeout"], effective_pom)
+                build_root = str(build.path.relative_to(output))
+                values = _validate_build(build, build_root, build_directory, options, result)
                 java.update(values["java_versions"])
                 boot.update(values["spring_boot_versions"])
                 dependencies.extend(values["dependencies"])
-                compiler_metadata.extend({"build_root": str(build.path.relative_to(output)), **item}
+                compiler_metadata.extend({"build_root": build_root, **item}
                                          for item in values.get("compiler_metadata", []))
                 inventory_resources.extend({"resource": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
                     for path in build_directory.iterdir() if path.name in {"effective-pom.xml", "effective-gradle.json"} or path.suffix == ".tgf")
@@ -376,7 +396,7 @@ def validate_stage(selected: Sequence[Repository], portfolio: Portfolio, config:
                            "inventory_resources": inventory_resources,
                            "inventory": {"java_versions": sorted(java), "spring_boot_versions": sorted(boot), "dependencies": dependencies,
                                          "compiler_metadata": compiler_metadata}})
-        except (PortfolioError, OSError, ValueError, KeyError) as exc:
+        except (PortfolioError, engine.MigrationError, ET.ParseError, OSError, ValueError, KeyError) as exc:
             result["error"] = str(exc)
         write_json(artifact_path(root, STAGES[4], "repositories", repo.key), result)
         results.append(result)

@@ -205,7 +205,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         event("invocation", command="run", resumed=bool(args.resume))
         print(f"Run: {root.name}")
         receipt = read_json(root / "run.json")
-        start = STAGES.index(args.from_stage) if args.from_stage else next((i for i, stage in enumerate(STAGES) if receipt["stages"].get(stage, {}).get("status") not in {"complete", "partial"} and not (receipt["stages"].get(stage, {}).get("status") == "prepared" and not args.execute)), len(STAGES))
+        completed = {"complete", "partial"}
+        if not args.execute:
+            completed.add("prepared")
+        start = STAGES.index(args.from_stage) if args.from_stage else next(
+            (index for index, stage in enumerate(STAGES)
+             if receipt["stages"].get(stage, {}).get("status") not in completed), len(STAGES))
         end = STAGES.index(args.through)
         if start > end and start != len(STAGES):
             # A paused checkpoint is still reviewable when all requested stages already ran.
@@ -217,6 +222,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         pending = receipt.get("pending_review")
         if pending and pending not in receipt["approvals"] and not checkpoint(root, pending, options):
             return 3
+        if start > end and receipt["status"] in {"failed", "complete", "published"}:
+            # A resume with no requested work must preserve the retained outcome.
+            return receipt.get("exit_code", 0)
         executing = True
         if not (root / "tool-versions.json").exists():
             versions(root)
@@ -249,7 +257,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     outputs = plan(sources, source_portfolio, config, root)
                 elif index == 3:
                     dependencies_ready(selected, portfolio, options, root)
-                    outputs = cli.migration_stage(sources, source_portfolio, read_json(root / "planned-policy.json"), root, args.execute)
+                    outputs = cli.migration_stage(sources, source_portfolio, read_json(root / "planned-policy.json"),
+                                                  root, args.execute, reuse_completed=args.from_stage is None)
                 elif index == 4:
                     outputs = validate_stage(selected, portfolio, config, options, root)
                 else:

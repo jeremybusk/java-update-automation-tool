@@ -23,7 +23,7 @@ workflow:
 
 CLI overrides: `--mode manual|unattended`, `--[no-]show-diffs`, `--[no-]include-dependencies`, `--[no-]dependency-override`, `--[no-]enable-publishing`, and repeatable `--publish-target local_repo|src_repo|dst_repo`. They become part of the saved run; provide the same overrides on resume. `--execute` authorizes migration/publication execution and can be added after preparing commands.
 
-A new invocation without `--resume` creates a separate run. `--from STAGE` reruns that stage and downstream requested stages in a saved run. Successful repository migrations and publishing target receipts are reused; failed migration attempts are kept in unique directories. To migrate new source content or change policy, create a new run. The report script reads retained runs using `--run-id` (default: `latest`).
+A new invocation without `--resume` creates a separate run. `--from STAGE` reruns that stage and downstream requested stages in a saved run. A plain resume reuses successful repository migrations; explicitly restarting at migration or an earlier stage creates fresh migration attempts. Publishing reconciles existing target receipts. All migration attempts are kept in unique directories. To migrate new source content or change policy, create a new run. The report script reads retained runs using `--run-id` (default: `latest`).
 
 ## Retained resources and reviews
 
@@ -54,6 +54,8 @@ Approvals bind captured policy/source commits, stage JSON, execution policies, a
 `runs` lists retained runs; `diff RUN_ID --compare-to OTHER_RUN_ID` creates a policy/source/output comparison. `show_diffs: true` generates comparisons with the previous retained run at checkpoints. Reports are generated views: regenerate with `portfolio.py report --run-id RUN_ID` or `scripts/render_reports.py --state .java-update --run-id RUN_ID`. Editing Markdown does not approve a stage.
 
 Local Git inputs must be clean; requested local and remote refs are honored. Remote discovery snapshots are shallow. Before publication, fetch full required ancestry; validation is tied to the same migrated commit and does not rerun merely to expand history.
+
+Discovery, migration, and validation share `discovery.max_depth` (default: 5).
 
 ## Dependencies, recipes, and pins
 
@@ -170,9 +172,10 @@ or altered files rebuild their recipe. The cache key includes the lock file,
 builder code, compiler JDK identity, and remote repository URL. Build logs are
 kept inside the cache.
 
-The four Boot matrix checks run in parallel on separate hosted runners, each
-with its own source cache. Multiple warm-cache commands using the same cache
-serialize behind a build lock. For planning, allow 15–30+ minutes for cold recipe
+The four Boot checks share one hosted runner and private source cache. CI warms
+recipes once, then runs at most two migration cases concurrently. Multiple
+warm-cache commands using the same cache serialize behind a build lock.
+For planning, allow 15–30+ minutes for cold recipe
 preparation, plus migration and application tests; this estimate has not been
 measured on a fresh GitHub Actions runner.
 
@@ -325,6 +328,8 @@ legitimately testless project. Declared Maven Failsafe checks run through `verif
 declared Gradle integration/contract tasks and configured suites also need fresh
 reports. Use configured suites for nonstandard task/report conventions. Report
 exemptions and exclusions are part of the validation policy and approvals.
+Custom suites retain separate evidence from automatically detected suites, even
+when their names match.
 
 Maven compliance follows the effective compiler release/target configuration and
 executions. Informational `java.version` values are recorded separately. Resolved
@@ -404,6 +409,14 @@ from these checked-in workflows.
 | gradle-catalog | Java 17 → 21 | Dependency version catalog |
 | boot35-maven, boot35-gradle | Boot 3.4.2 → 3.5.x; Java 17 → 21 | Framework recipes |
 | boot4-maven, boot4-gradle | Boot 3.5.1 → 4.0.x; Java 17 → 21 | Framework recipes |
+
+CI caches pip downloads, the checksum-verified Maven 3.9.11 archive, and Maven
+dependencies for Java-only cases. Native jobs install only their required build
+tool; Gradle jobs retain their existing dependency cache. Boot jobs keep compiled
+recipes and Gradle caches private to the runner. Superseded pull-request runs
+are cancelled automatically. Integration timings,
+including recipe preparation, appear in the job summary. Tests still execute
+freshly; cached build output cannot qualify as validation evidence.
 
 CI uses Maven 3.9.11, Gradle 8.14.3 with JDK 21 for Java-21/Boot cases, and Gradle
 9.1.0 with JDK 25 for Java-25 cases. Recipe versions are pinned in the migration

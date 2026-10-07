@@ -86,6 +86,16 @@ def load_config(path: Path) -> dict[str, Any]:
         acceptable = target.get("acceptable")
         if not isinstance(acceptable, list) or not acceptable:
             errors.append(f"targets.{name}.acceptable must be a non-empty list")
+    discovery = data.get("discovery", {})
+    if not isinstance(discovery, dict):
+        errors.append("discovery must be a mapping")
+    else:
+        tool = discovery.get("build_tool", "auto")
+        if not isinstance(tool, str) or tool not in {"auto", "maven", "gradle"}:
+            errors.append("discovery.build_tool must be auto, maven, or gradle")
+        depth = discovery.get("max_depth", 5)
+        if type(depth) is not int or depth < 0:
+            errors.append("discovery.max_depth must be a non-negative integer")
     if errors:
         raise PortfolioError("invalid configuration:\n- " + "\n- ".join(errors))
     return data

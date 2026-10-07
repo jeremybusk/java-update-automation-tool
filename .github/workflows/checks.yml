@@ -11,7 +11,7 @@ permissions:
   contents: read
 concurrency:
   group: migration-checks-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   fast:
     runs-on: ubuntu-latest
@@ -20,6 +20,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: pip
       - run: pip install -r requirements.txt jsonschema
       - run: python -m unittest discover -s tests -v
       - run: python portfolio.py validate
@@ -57,12 +58,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {case: maven17, java: '21', gradle: '8.14.3'}
+          - {case: maven17, java: '21'}
           - {case: gradle17, java: '21', gradle: '8.14.3'}
-          - {case: maven8, java: '25', gradle: '9.1.0'}
+          - {case: maven8, java: '25'}
           - {case: gradle8, java: '25', gradle: '9.1.0'}
-          - {case: maven-bom, java: '21', gradle: '8.14.3'}
-          - {case: maven-multi, java: '21', gradle: '8.14.3'}
+          - {case: maven-bom, java: '21'}
+          - {case: maven-multi, java: '21'}
           - {case: gradle-catalog, java: '21', gradle: '8.14.3'}
           - {case: gradle-multi, java: '21', gradle: '8.14.3'}
     steps:
@@ -70,19 +71,30 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: pip
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: ${{ matrix.java }}
+          cache: ${{ startsWith(matrix.case, 'maven') && 'maven' || '' }}
+          cache-dependency-path: |
+            tests/integration_fixtures.py
+            java_migrator.py
       - uses: gradle/actions/setup-gradle@v4
+        if: startsWith(matrix.case, 'gradle')
         with:
           gradle-version: ${{ matrix.gradle }}
+      - uses: actions/cache@v4
+        if: startsWith(matrix.case, 'maven')
+        with:
+          path: ~/.cache/java-update/maven
+          key: maven-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/setup_ci_maven.py') }}
       - run: python scripts/setup_ci_maven.py
+        if: startsWith(matrix.case, 'maven')
       - run: pip install -r requirements.txt
-      - run: python -m unittest discover -s tests -p test_integration.py -v
+      - run: python scripts/run_ci_integration.py "${CI_CASE}"
         env:
-          JAVA_UPDATE_INTEGRATION: '1'
-          JAVA_UPDATE_CASE: ${{ matrix.case }}
+          CI_CASE: ${{ matrix.case }}
           JAVA_UPDATE_ARTIFACTS: ${{ runner.temp }}/migration-evidence
       - uses: actions/upload-artifact@v4
         if: always()
@@ -91,16 +103,13 @@ jobs:
           path: |
             ${{ runner.temp }}/migration-evidence/**/evidence.tar.gz
             ${{ runner.temp }}/migration-evidence/**/transcript.txt
+            ${{ runner.temp }}/migration-evidence/logs/*.log
   boot:
     needs: [fast, changes]
     # Source builds use a free token for Apache build dependencies.
     if: needs.changes.outputs.native == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        case: [boot35-maven, boot4-maven, boot35-gradle, boot4-gradle]
     steps:
       - name: Configure recipe cache
         env:
@@ -111,6 +120,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: pip
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -120,33 +130,26 @@ jobs:
           gradle-version: '8.14.3'
           # Public repository caches must not distribute compiled MSAL recipes.
           cache-disabled: true
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/java-update/maven
+          key: maven-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/setup_ci_maven.py') }}
       - run: python scripts/setup_ci_maven.py
       - run: pip install -r requirements.txt
-      - name: Build and cache recipes from source
-        run: |
-          python - <<'PY'
-          import subprocess, yaml
-          rewrite = yaml.safe_load(open('java-update.yml'))['migration']['openrewrite']
-          if rewrite.get('recipe_repository') in {'source', 'auto'}:
-              subprocess.run(['python', 'scripts/build_recipe_sources.py'], check=True)
-          PY
+      - name: Prepare recipes once and run Spring Boot migrations
+        run: python scripts/run_ci_integration.py --prepare-recipes --jobs 2 boot35-maven boot4-maven boot35-gradle boot4-gradle
         env:
-          CODE_GENOME_USERNAME: ${{ secrets.CODE_GENOME_USERNAME }}
-          CODE_GENOME_TOKEN: ${{ secrets.CODE_GENOME_TOKEN }}
-      - run: python -m unittest discover -s tests -p test_integration.py -v
-        env:
-          JAVA_UPDATE_INTEGRATION: '1'
-          JAVA_UPDATE_CASE: ${{ matrix.case }}
           JAVA_UPDATE_ARTIFACTS: ${{ runner.temp }}/migration-evidence
           CODE_GENOME_USERNAME: ${{ secrets.CODE_GENOME_USERNAME }}
           CODE_GENOME_TOKEN: ${{ secrets.CODE_GENOME_TOKEN }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: evidence-${{ matrix.case }}
+          name: evidence-boot
           path: |
             ${{ runner.temp }}/migration-evidence/**/evidence.tar.gz
             ${{ runner.temp }}/migration-evidence/**/transcript.txt
+            ${{ runner.temp }}/migration-evidence/logs/*.log
             ${{ env.JAVA_UPDATE_RECIPE_CACHE }}/**/logs/*.log
   migration-gate:
     needs: [fast, changes, native, boot]
