@@ -468,6 +468,31 @@ def prepare_repo(
     return path, True
 
 
+def ignore_build_outputs(repo: Path, builds: list[BuildRoot], memberships: list[dict[str, str]]) -> None:
+    """Keep generated output out of commits without changing application ignore files."""
+    if not (repo / ".git").exists():
+        return
+    roots = builds + [BuildRoot(repo / item["member"], item["tool"]) for item in memberships]
+    patterns = set()
+    for build in roots:
+        try:
+            relative = build.path.resolve().relative_to(repo.resolve()).as_posix()
+        except ValueError:
+            continue
+        prefix = "" if relative == "." else relative + "/"
+        prefix = re.sub(r"([\\*?\[\]])", r"\\\1", prefix)
+        if "\n" in prefix or "\r" in prefix:
+            raise MigrationError("build paths must not contain line breaks")
+        for name in ("target",) if build.tool == "maven" else ("build", ".gradle"):
+            patterns.add("/" + prefix + name + "/")
+    exclude = Path(capture(["git", "rev-parse", "--git-path", "info/exclude"], repo))
+    if not exclude.is_absolute():
+        exclude = repo / exclude
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    with exclude.open("a", encoding="utf-8") as stream:
+        stream.write("\n" + "\n".join(sorted(patterns)) + "\n")
+
+
 def check_clean(path: Path, allow_dirty: bool) -> None:
     if (path / ".git").exists() and capture(["git", "status", "--porcelain"], path) and not allow_dirty:
         raise MigrationError("repository has uncommitted changes; commit/stash them or pass --allow-dirty")
@@ -1465,7 +1490,9 @@ def migrate_one(spec: RepoSpec, args: argparse.Namespace, env: dict[str, str], a
         repo, cloned = prepare_repo(spec, args, env, log, askpass)
         result.path = str(repo)
         check_clean(repo, args.allow_dirty)
-        builds = discover_builds(repo, args.build_tool, args.max_depth)
+        memberships = []
+        builds = discover_builds(repo, args.build_tool, args.max_depth, memberships=memberships)
+        ignore_build_outputs(repo, builds, memberships)
         result.branch = checkout_branch(repo, args, env, log)
         state = args.workspace / ".state"
         state.mkdir(parents=True, exist_ok=True)
