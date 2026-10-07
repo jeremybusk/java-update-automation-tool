@@ -5,9 +5,11 @@ plugins {
 group = 'com.example.legacy'
 version = '1.0-SNAPSHOT'
 
-// Intentionally old Gradle/Java conventions for migration testing.
-sourceCompatibility = 1.8
-targetCompatibility = 1.8
+// Keep the Java 8 baseline executable on current Gradle.
+java {
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
+}
 
 repositories {
     mavenCentral()
