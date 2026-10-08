@@ -10,22 +10,6 @@ python3 portfolio.py run --application legacy-catalog
 
 The checked-in portfolio contains local examples. A default run requests review after discovery and stops at planning once its checkpoints are approved. Migration requires `--execute`; the default publishing target is an inspectable local Git repository.
 
-## One repository with arguments
-
-Use [`simple-cli-apps/modernize.py`](simple-cli-apps/README.md) to supply a source
-Git URL, an existing destination, and a custom branch without maintaining
-`repositories.yml`. It works from any directory and reuses the validation gates.
-
-```bash
-python3 simple-cli-apps/modernize.py \
-  --source git@github.com:acme/legacy-app.git \
-  --destination git@github.com:acme/modernized-app.git \
-  --branch modernized/java-25 --java 25 --execute
-```
-
-Omit `--execute` to produce a plan. See the [standalone CLI guide](simple-cli-apps/README.md)
-for clone/setup instructions, prerequisites, local testing, and retries.
-
 ## Stages
 
 | Stage | Result |
