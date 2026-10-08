@@ -330,6 +330,9 @@ reports. Use configured suites for nonstandard task/report conventions. Report
 exemptions and exclusions are part of the validation policy and approvals.
 Custom suites retain separate evidence from automatically detected suites, even
 when their names match.
+Migration commits ignore standard Maven/Gradle output directories for discovered
+build roots and modules, using checkout-local Git rules. Tracked files remain
+tracked; application `.gitignore` files are not changed.
 
 Maven compliance follows the effective compiler release/target configuration and
 executions. Informational `java.version` values are recorded separately. Resolved
